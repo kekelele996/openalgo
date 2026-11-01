@@ -547,6 +547,106 @@ def squareoff_status():
         ), 500
 
 
+def _parse_corporate_action_payload(data):
+    """Turn a preview/apply request body into parsed corporate actions.
+
+    Accepts either {"csv": "<notice text>"} or {"actions": [<dicts>]}.
+    """
+    from sandbox.corporate_actions import CorporateActionError, parse_action_dicts, parse_notice_csv
+
+    if not isinstance(data, dict):
+        raise CorporateActionError("Request body must be JSON")
+
+    csv_text = data.get("csv")
+    if csv_text:
+        return parse_notice_csv(csv_text)
+
+    rows = data.get("actions")
+    if rows:
+        return parse_action_dicts(rows)
+
+    raise CorporateActionError("Provide a 'csv' notice or an 'actions' list")
+
+
+@sandbox_bp.route("/api/corporate-actions/preview", methods=["POST"])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def api_corporate_actions_preview():
+    """Preview every account/position a corporate action notice would change.
+
+    Read-only: no data is written. A notice that was already applied returns
+    its stored before/after result flagged ``already_applied``.
+    """
+    try:
+        from sandbox.corporate_actions import CorporateActionError, preview_actions
+
+        data = request.get_json(silent=True) or {}
+        actions = _parse_corporate_action_payload(data)
+        results = preview_actions(actions)
+        return jsonify({"status": "success", "data": {"actions": results}})
+    except CorporateActionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        logger.exception(f"Error previewing corporate action notice: {e}")
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": f"Error previewing corporate action notice: {str(e)}",
+                }
+            ),
+            500,
+        )
+
+
+@sandbox_bp.route("/api/corporate-actions/apply", methods=["POST"])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def api_corporate_actions_apply():
+    """Apply a confirmed corporate action notice.
+
+    Idempotent: the same ``(notice_id, symbol, exchange)`` line converts the
+    books exactly once; re-importing it replays the stored result without
+    changing any data.
+    """
+    try:
+        from sandbox.corporate_actions import (
+            CorporateActionBusy,
+            CorporateActionError,
+            apply_actions,
+        )
+
+        user_id = session.get("user")
+        data = request.get_json(silent=True) or {}
+        actions = _parse_corporate_action_payload(data)
+        results, summary = apply_actions(actions, applied_by=user_id)
+        return jsonify(
+            {
+                "status": "success",
+                "message": (
+                    f"Applied {summary['newly_applied']} notice line(s); "
+                    f"{summary['already_applied']} already applied."
+                ),
+                "data": {"actions": results, "summary": summary},
+            }
+        )
+    except CorporateActionBusy as e:
+        return jsonify({"status": "error", "message": str(e)}), 409
+    except CorporateActionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        logger.exception(f"Error applying corporate action notice: {e}")
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": f"Error applying corporate action notice: {str(e)}",
+                }
+            ),
+            500,
+        )
+
+
 @sandbox_bp.route("/mypnl/api/data")
 @check_session_validity
 @limiter.limit(API_RATE_LIMIT)

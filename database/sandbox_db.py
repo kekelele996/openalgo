@@ -430,6 +430,65 @@ class SandboxGTTLeg(Base):
     )
 
 
+class SandboxCorporateAction(Base):
+    """Ledger of imported corporate action notices (stock split / bonus issue).
+
+    One row per ``(notice_id, symbol, exchange)`` line in an imported notice.
+    The row is written only when the notice is confirmed and applied, which is
+    what makes re-importing the same notice idempotent: apply looks here first
+    and replays the stored result instead of converting the same holdings and
+    resting orders a second time.
+    """
+
+    __tablename__ = "sandbox_corporate_actions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Idempotency key. Either supplied in the notice file or derived
+    # deterministically from the normalised action line, so the same file
+    # hashed twice produces the same notice_id.
+    notice_id = Column(String(100), nullable=False, index=True)
+
+    symbol = Column(String(50), nullable=False, index=True)
+    exchange = Column(String(20), nullable=False, index=True)
+
+    # split: ratio_from old shares become ratio_to new shares (1:5 -> x5, /5)
+    # bonus: ratio_to bonus shares for every ratio_from held (1:1 -> x2, /2)
+    action_type = Column(String(10), nullable=False)
+    ratio_from = Column(Integer, nullable=False)
+    ratio_to = Column(Integer, nullable=False)
+    effective_date = Column(Date, nullable=False, index=True)
+
+    # Only "applied" rows are ever written; the column documents the lifecycle
+    # and leaves room for future states without another migration.
+    status = Column(String(20), nullable=False, default="applied")
+
+    # Counts captured at apply time, echoed back on a repeated import.
+    affected_accounts = Column(Integer, nullable=False, default=0)
+    positions_adjusted = Column(Integer, nullable=False, default=0)
+    holdings_adjusted = Column(Integer, nullable=False, default=0)
+    orders_adjusted = Column(Integer, nullable=False, default=0)
+    gtts_adjusted = Column(Integer, nullable=False, default=0)
+
+    # Full per-account adjustment result (JSON), so a repeated import can show
+    # the same before/after preview without changing any data.
+    result_json = Column(Text, nullable=True)
+
+    applied_by = Column(String(50), nullable=True)
+    applied_at = Column(DateTime, nullable=False, default=ist_now)
+    created_at = Column(DateTime, nullable=False, default=ist_now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "notice_id", "symbol", "exchange", name="uniq_corporate_action_notice_symbol"
+        ),
+        Index("idx_corporate_action_symbol", "symbol", "exchange"),
+        CheckConstraint("action_type IN ('split', 'bonus')", name="check_corporate_action_type"),
+        CheckConstraint("status = 'applied'", name="check_corporate_action_status"),
+        CheckConstraint("ratio_from > 0 AND ratio_to > 0", name="check_corporate_action_ratio"),
+    )
+
+
 def init_db():
     """Initialize sandbox database and tables"""
     from database.db_init_helper import init_db_with_logging

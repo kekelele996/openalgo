@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  FileSpreadsheet,
   Loader2,
   Pause,
   Radio,
@@ -17,6 +18,7 @@ import {
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { tradingApi } from '@/api/trading'
 import { ChartSymbolLink } from '@/components/trading/ChartSymbolLink'
+import { CorporateActionDialog } from '@/components/trading/CorporateActionDialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -58,7 +60,7 @@ import { usePageVisibility } from '@/hooks/usePageVisibility'
 import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
 import { cn, makeFormatCurrency, sanitizeCSV } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
-import { onModeChange } from '@/stores/themeStore'
+import { onModeChange, useThemeStore } from '@/stores/themeStore'
 import type { Position } from '@/types/trading'
 import { showToast } from '@/utils/toast'
 
@@ -148,6 +150,9 @@ const PRODUCT_COLORS: Record<string, string> = {
 export default function Positions() {
   const { apiKey, user } = useAuthStore()
   const { isCrypto } = useSupportedExchanges()
+  const appMode = useThemeStore((s) => s.appMode)
+  const isSandbox = appMode === 'analyzer'
+  const [corporateActionOpen, setCorporateActionOpen] = useState(false)
   const formatCurrency = useMemo(() => makeFormatCurrency(user?.broker), [user?.broker])
   const [positions, setPositions] = useState<Position[]>([])
   const [isLoading, setIsLoading] = useState(true)
@@ -627,6 +632,25 @@ export default function Positions() {
           <p className="text-muted-foreground">Monitor and manage your active trading positions</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          {/* Corporate action import (sandbox only): split/bonus adjustment
+              lives on the positions page itself, no separate entry point. */}
+          {isSandbox && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setCorporateActionOpen(true)}
+              title="Import a split or bonus notice and preview its effect"
+            >
+              <FileSpreadsheet className="h-4 w-4 mr-2" />
+              Corporate Action
+            </Button>
+          )}
+          <CorporateActionDialog
+            open={corporateActionOpen}
+            onOpenChange={setCorporateActionOpen}
+            onApplied={() => fetchPositions(true)}
+          />
+
           {/* Settings Button */}
           <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
             <DialogTrigger asChild>

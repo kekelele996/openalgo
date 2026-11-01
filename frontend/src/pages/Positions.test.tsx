@@ -15,8 +15,8 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { fireEvent, render, screen, within } from '@/test/test-utils'
 import type { Position } from '@/types/trading'
-import { render, screen, within } from '@/test/test-utils'
 
 const mocks = vi.hoisted(() => ({
   getPositions: vi.fn(),
@@ -35,7 +35,13 @@ vi.mock('@/stores/authStore', () => ({
   useAuthStore: () => ({ apiKey: 'test-api-key', user: { broker: 'zerodha' } }),
 }))
 
-vi.mock('@/stores/themeStore', () => ({ onModeChange: () => () => {} }))
+const themeState = vi.hoisted(() => ({ appMode: 'live' as string }))
+
+vi.mock('@/stores/themeStore', () => ({
+  onModeChange: () => () => {},
+  useThemeStore: (selector: (state: { appMode: string }) => unknown) =>
+    selector({ appMode: themeState.appMode }),
+}))
 
 // The live-price hook owns the WebSocket. Pass the positions straight through
 // so the table renders exactly what the API returned.
@@ -88,6 +94,7 @@ describe('Positions close button', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()
+    themeState.appMode = 'live'
   })
 
   it('offers Close on a position that is still open', async () => {
@@ -170,5 +177,33 @@ describe('Positions close button', () => {
     await renderPositions([CLOSED_POSITION])
 
     expect(screen.getByRole('button', { name: /Close All/ })).toBeDisabled()
+  })
+})
+
+describe('Corporate action entry point', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+  })
+
+  it('is not offered in live mode (no new entry point outside the sandbox)', async () => {
+    themeState.appMode = 'live'
+    await renderPositions([OPEN_POSITION])
+
+    expect(screen.queryByRole('button', { name: /Corporate Action/ })).not.toBeInTheDocument()
+  })
+
+  it('opens the notice import dialog from the positions page in sandbox mode', async () => {
+    themeState.appMode = 'analyzer'
+    await renderPositions([OPEN_POSITION])
+
+    const entry = screen.getByRole('button', { name: /Corporate Action/ })
+    expect(entry).toBeInTheDocument()
+    fireEvent.click(entry)
+
+    // Phase 1 of the dialog: file choice and preview, but no request yet.
+    expect(screen.getByText(/Choose notice CSV file/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Preview affected accounts/ })).toBeInTheDocument()
+    expect(mocks.getPositions).toHaveBeenCalled()
   })
 })
