@@ -1800,8 +1800,9 @@ def test_the_signatures_two_other_callers_import_are_these():
         run_config.deployments_of: "(script: str) -> dict[str, dict]",
         run_config.write_run_config: (
             "(script: str, symbol: str, exchange: str, interval: str, product: str = '', "
-            "user_id: str | None = None, inputs: Any = None, deployment: str = '') "
-            "-> tuple[bool, str]"
+            "user_id: str | None = None, inputs: Any = None, deployment: str = '', *, "
+            "source_hash: str | None = None, "
+            "input_fingerprints: dict[str, str] | None = None) -> tuple[bool, str]"
         ),
         run_config.delete_run_config: "(name: str) -> tuple[bool, str]",
         run_config.all_run_configs: "() -> dict[str, dict]",

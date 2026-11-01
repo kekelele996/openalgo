@@ -312,6 +312,9 @@ EXPECTED_ROUTES = {
     "/openscript/runner/status/<path:filename>": {"GET"},
     "/openscript/runner/config": {"GET"},
     "/openscript/runner/config/<path:filename>": {"GET", "POST", "DELETE"},
+    # The saved inputs checked against the inputs the script declares now,
+    # shown inside the deployment's own settings rather than on another page.
+    "/openscript/runner/config/<path:filename>/review": {"GET"},
     "/openscript/runner/schedule/<path:filename>": {"POST", "DELETE"},
     # What one strategy has done. The converter is the default one and not
     # `path`, because a script name can never hold a slash and a rule that

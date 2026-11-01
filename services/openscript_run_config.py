@@ -122,6 +122,13 @@ FIELDS: tuple[str, ...] = (
     "product",
     "user_id",
     "inputs",
+    # Which compiled program the inputs were last reconciled against, and the
+    # per-input declaration fingerprints they were checked against. The start
+    # gate compares both with the program on disk, so a script changed on the
+    # server is noticed from every device and on every start. See
+    # ``services.openscript_inputs``.
+    "source_hash",
+    "input_fingerprints",
 )
 
 #: The most settings one script may carry, and the longest a key or a piece of
@@ -172,9 +179,26 @@ def _normalised(entry: dict) -> dict:
     filled = dict.fromkeys(FIELDS, "")
     filled["user_id"] = None
     filled["inputs"] = {}
+    filled["source_hash"] = ""
+    filled["input_fingerprints"] = {}
     filled.update(entry)
     for name in ("deployment", "script", "symbol", "exchange", "interval", "product"):
         filled[name] = "" if filled.get(name) is None else str(filled[name])
+    filled["source_hash"] = (
+        "" if filled.get("source_hash") is None else str(filled["source_hash"])
+    )
+    # Read back through the same shape a save writes: a file edited by hand must
+    # not be able to hand the start gate fingerprints that are not fingerprints,
+    # which would make its stale-input check claim a change or the lack of one.
+    held_fingerprints = filled.get("input_fingerprints")
+    if isinstance(held_fingerprints, dict):
+        filled["input_fingerprints"] = {
+            str(key): str(value)
+            for key, value in held_fingerprints.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+    else:
+        filled["input_fingerprints"] = {}
     # Read back through the same check that let it in. A file an operator edited
     # by hand, or one written by an older version, reaches a run otherwise, and
     # the run is where a bad value costs an order rather than a message.
@@ -232,6 +256,16 @@ def _checked_inputs(given: Any) -> tuple[dict, str]:
         return {}, f"{key} was given something a parameter cannot be."
 
     return kept, ""
+
+
+def checked_inputs(given: Any) -> tuple[dict, str]:
+    """The public shape of the parameter check, for the route that reconciles.
+
+    The settings route has to reconcile what was submitted against the script's
+    declarations *before* the write, so it needs the same checked map the write
+    uses rather than a second copy of the check.
+    """
+    return _checked_inputs(given)
 
 
 def all_run_configs() -> dict[str, dict]:
@@ -376,6 +410,9 @@ def write_run_config(
     user_id: str | None = None,
     inputs: Any = None,
     deployment: str = "",
+    *,
+    source_hash: str | None = None,
+    input_fingerprints: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
     """Save what one script is run on, replacing whatever was saved before.
 
@@ -491,6 +528,16 @@ def write_run_config(
             "product": product,
             "user_id": user_id,
             "inputs": settings,
+            # The program version these inputs were reconciled against, and the
+            # declaration fingerprints. Written only by the settings route after
+            # its check was confirmed, so the start gate can tell a script that
+            # changed on the server from one these settings were saved against.
+            "source_hash": str(source_hash or ""),
+            "input_fingerprints": (
+                {str(name): str(mark) for name, mark in input_fingerprints.items()}
+                if isinstance(input_fingerprints, dict)
+                else {}
+            ),
             "updated_at": _ist_now().strftime("%Y-%m-%d %H:%M:%S IST"),
         }
         # The side this deployment last traded on is not a setting and survives

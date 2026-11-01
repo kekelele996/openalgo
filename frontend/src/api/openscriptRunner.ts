@@ -106,6 +106,43 @@ export interface RunnerOverview {
 }
 
 /**
+ * One input reviewed against the inputs the script's compiled program declares
+ * now. The server produces these from the program file itself, so the answer is
+ * the same from every device and every kind of start.
+ */
+export interface InputReviewItem {
+  key: string
+  label: string
+  kind: string
+  /** The value the deployment carried, when there was one. */
+  saved?: boolean | number | string | null
+  /** The default the new script states for it, when one exists. */
+  default?: boolean | number | string | null
+  /**
+   * Why it landed in this list:
+   * `removed` (no longer declared), `added` (declared now, default applies),
+   * `kind`/`bounds`/`options`/`empty`/`missing` (must be re-entered),
+   * `changed` (still valid, but the declaration changed since it was set).
+   */
+  reason?: string
+}
+
+/** The item-by-item answer to "which saved inputs still belong to this script". */
+export interface InputReview {
+  script: string
+  source_hash?: string
+  saved_hash?: string
+  changed: boolean
+  keep: InputReviewItem[]
+  default: InputReviewItem[]
+  reset: InputReviewItem[]
+  /** The values a confirmed save will keep. */
+  clean: Record<string, boolean | number | string>
+  /** Per-input declaration fingerprints the confirmed save stores. */
+  fingerprints?: Record<string, string>
+}
+
+/**
  * A refusal the server wrote for a person to read, or a sentence about the
  * server itself.
  *
@@ -115,17 +152,26 @@ export interface RunnerOverview {
  */
 export class RunnerError extends Error {
   readonly status: number
-  constructor(message: string, status: number) {
+  /** Present on a 409 save check, so the panel can list it and ask once. */
+  readonly review: InputReview | null
+  constructor(message: string, status: number, review: InputReview | null = null) {
     super(message)
     this.name = 'RunnerError'
     this.status = status
+    this.review = review
   }
 }
 
 function problemFrom(error: unknown, fallback: string): RunnerError {
-  const answered = (error as { response?: { status?: number; data?: { message?: string } } })
-    ?.response
-  return new RunnerError(answered?.data?.message || fallback, answered?.status ?? 0)
+  const answered = (
+    error as {
+      response?: { status?: number; data?: { message?: string; review?: unknown } }
+    }
+  )?.response
+  const data = answered?.data
+  const review =
+    data && typeof data === 'object' && 'review' in data ? (data.review as InputReview) : null
+  return new RunnerError(data?.message || fallback, answered?.status ?? 0, review)
 }
 
 export async function overview(signal?: AbortSignal): Promise<RunnerOverview> {
@@ -218,8 +264,14 @@ export async function closeStrategy(name: string): Promise<void> {
  * Creating a second deployment on the same script, instrument and interval is
  * refused by the server, because that is one strategy running twice on one
  * instrument. The refusal comes back in its own words and says what to do.
+ *
+ * The server checks the inputs against the inputs the saved script declares
+ * now *before* it writes. A difference answers 409 carrying the item by item
+ * review and leaves the old settings untouched; the panel lists the review in
+ * the deployment's own settings and calls this once more with `confirm` after
+ * the trader has reviewed it and set anything marked for re-entry.
  */
-export async function saveSettings(settings: RunSettings): Promise<void> {
+export async function saveSettings(settings: RunSettings, confirm = false): Promise<void> {
   try {
     await webClient.post(`${BASE}/config/${encodeURIComponent(settings.file)}`, {
       symbol: settings.symbol,
@@ -234,9 +286,32 @@ export async function saveSettings(settings: RunSettings): Promise<void> {
       // Absent on a new deployment, which is what tells the server to mint an
       // id rather than take over the one a removed deployment had.
       ...(settings.deployment ? { deployment: settings.deployment } : {}),
+      // The answer to the review the first save returned. Nothing is written
+      // without it when the script changed under a carried value.
+      ...(confirm ? { confirm: true } : {}),
     })
   } catch (error) {
     throw problemFrom(error, `The settings for ${settings.file} could not be saved.`)
+  }
+}
+
+/**
+ * Review one deployment's saved inputs against the inputs its script declares
+ * now, without changing anything.
+ *
+ * Shown inside the deployment's own settings when they are opened, so a script
+ * changed on the server is visible before a start is pressed. The same
+ * reconciliation is what the save runs and what every start runs again.
+ */
+export async function reviewSettings(name: string): Promise<InputReview> {
+  try {
+    const res = await webClient.get<{ status: string; review?: InputReview }>(
+      `${BASE}/config/${encodeURIComponent(name)}/review`
+    )
+    if (!res.data.review) throw new Error('The review came back empty.')
+    return res.data.review
+  } catch (error) {
+    throw problemFrom(error, `The inputs for ${name} could not be checked.`)
   }
 }
 

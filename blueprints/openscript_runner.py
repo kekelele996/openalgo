@@ -84,10 +84,12 @@ import pytz
 from flask import Blueprint, jsonify, request, session
 
 import blueprints.openscript as openscript_sources
+from services import openscript_inputs
 from services.openscript_deployment import is_deployment_id
 from services.openscript_run_config import (
     PRODUCTS,
     all_run_configs,
+    checked_inputs,
     delete_run_config,
     is_script_name,
     read_run_config,
@@ -151,8 +153,18 @@ def _names_something(given: str) -> bool:
 # What a settings body may carry, and nothing else. The list is short on
 # purpose: every field a run needs is here, and a field a caller invents is
 # refused by name rather than dropped, which is what keeps an imagined switch to
-# live from looking like it worked.
-SETTINGS_FIELDS = ("symbol", "exchange", "interval", "product", "inputs", "deployment")
+# live from looking like it worked. ``confirm`` is not a setting: it is the
+# trader's answer to the input review the first save returns, and the only thing
+# that lets a save that would change an input's meaning write once.
+SETTINGS_FIELDS = (
+    "symbol",
+    "exchange",
+    "interval",
+    "product",
+    "inputs",
+    "deployment",
+    "confirm",
+)
 
 # The most logs one answer names. A script run every day for a year has that
 # many files, and a status page needs the recent ones rather than all of them.
@@ -963,6 +975,50 @@ def get_settings(filename):
     )
 
 
+@openscript_runner_bp.route("/config/<path:filename>/review", methods=["GET"])
+@check_session_validity
+def review_settings(filename):
+    """Review one deployment's saved inputs against the inputs its script declares now.
+
+    This is the check the settings panel shows when a deployment is opened, and
+    it is the same reconciliation the save runs and the start gate runs again:
+    one implementation, one answer, so the list in the panel, the answer to a
+    save and the sentence a start is refused with cannot disagree.
+
+    A script with no compiled program is not an empty review. Nothing can be
+    checked in that state, and saying "all clear" for it would be the wrong
+    sentence the first time the start was pressed, so it is refused by name.
+    """
+    if not _names_something(filename):
+        return _refusal(filename)
+
+    saved = read_run_config(filename)
+    if saved is None:
+        return jsonify(
+            {"status": "error", "message": f"{filename} has no run settings saved."}
+        ), 404
+
+    script = str(saved.get("script") or "") or (filename if is_script_name(filename) else "")
+    review = openscript_inputs.review_for(
+        script,
+        saved.get("inputs") or {},
+        saved.get("input_fingerprints") or {},
+    )
+    if review is None:
+        return jsonify(
+            {
+                "status": "error",
+                "message": (
+                    f"{script} has no compiled program that can be read. Open it in the chart and "
+                    "save it once the console shows no errors."
+                ),
+            }
+        ), 409
+
+    review["saved_hash"] = str(saved.get("source_hash") or "")
+    return jsonify({"status": "success", "review": review})
+
+
 @openscript_runner_bp.route("/config/<path:filename>", methods=["POST"])
 @check_session_validity
 def set_settings(filename):
@@ -1015,7 +1071,7 @@ def set_settings(filename):
         ), 400
 
     for field in SETTINGS_FIELDS:
-        if field == "inputs":
+        if field in ("inputs", "confirm"):
             continue
         value = body.get(field)
         if value is not None and not isinstance(value, str):
@@ -1037,6 +1093,74 @@ def set_settings(filename):
             }
         ), 400
 
+    # ``confirm`` is a yes and never text, unlike the settings beside it.
+    confirm = bool(body.get("confirm"))
+
+    submitted, wrong = checked_inputs(body.get("inputs"))
+    if wrong:
+        return jsonify({"status": "error", "message": wrong}), 400
+
+    # **Reconcile the submitted values with the inputs the script declares now,
+    # before anything is written.** A script saved in a newer version may have
+    # renamed an input, changed a kind, moved a bound or taken a choice away, and
+    # the carried value still parses: the backtest runs and the live order is
+    # sized by whatever the value means in the new script. The first save names
+    # each outcome and writes nothing; the confirmed save writes once, through
+    # the settings store's atomic write, so a refusal leaves the old settings
+    # exactly as they were. A deployment that does not exist yet has no
+    # fingerprints, so nothing is claimed about a change for it.
+    held_before = read_run_config(body["deployment"]) if body.get("deployment") else None
+    program = openscript_inputs.read_program(filename)
+    source_hash = ""
+    fingerprints: dict = {}
+    if program is not None:
+        declarations = openscript_inputs.declarations_of(program)
+        current_hash = openscript_inputs.source_hash_of(program)
+        # A confirmation is the conscious reconciliation point, so the check
+        # then asks only whether each value is one the new script accepts.
+        baseline = {} if confirm else (held_before or {}).get("input_fingerprints") or {}
+        review = openscript_inputs.reconcile(declarations, submitted, baseline)
+        review["script"] = filename
+        review["source_hash"] = current_hash
+        review["saved_hash"] = str((held_before or {}).get("source_hash") or "")
+        review["changed"] = bool(review["default"] or review["reset"])
+
+        # The first save only reports: every outcome comes back in the review
+        # and nothing is written. A value the new script cannot accept is part
+        # of that list, so the trader fixes it in the form beside the message.
+        # On the confirmed save the same value is a refusal: by then it has
+        # been named once and the form has had its chance to offer another.
+        if review["changed"] and not confirm:
+            return jsonify(
+                {
+                    "status": "confirm",
+                    "review": review,
+                    "message": openscript_inputs.confirm_message(review),
+                }
+            ), 409
+
+        if review["reset"]:
+            names = ", ".join(
+                str(one.get("label") or one.get("key")) for one in review["reset"]
+            )
+            return jsonify(
+                {
+                    "status": "error",
+                    "review": review,
+                    "message": (
+                        f"These inputs need a value the new script accepts: {names}. Set them, "
+                        "then save again."
+                    ),
+                }
+            ), 400
+
+        # The values the one write keeps: valid against the declarations as
+        # they stand now, with everything else dropped to the script's own
+        # value rather than carried.
+        submitted = review["clean"]
+        source_hash = current_hash
+        fingerprints = review["fingerprints"]
+
     ok, message = write_run_config(
         filename,
         symbol=body.get("symbol") or "",
@@ -1044,8 +1168,10 @@ def set_settings(filename):
         interval=body.get("interval") or "",
         product=body.get("product") or "",
         user_id=session.get("user"),
-        inputs=body.get("inputs"),
+        inputs=submitted,
         deployment=body.get("deployment") or "",
+        source_hash=source_hash,
+        input_fingerprints=fingerprints,
     )
     if not ok:
         return jsonify({"status": "error", "message": message}), 400

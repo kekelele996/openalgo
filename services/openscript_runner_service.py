@@ -101,6 +101,7 @@ from time import monotonic, sleep
 import psutil
 import pytz
 
+from services import openscript_inputs
 from services.openscript_commands import ask as ask_to_close
 from services.openscript_commands import clear as forget_instruction
 from services.openscript_commands import close_confirmed
@@ -697,6 +698,20 @@ def start_run(
         return False, (
             f"{product!r} is not a product this platform sends. Use one of {', '.join(PRODUCTS)}."
         )
+
+    # **Re-read the script's own declared inputs against what was saved, every
+    # time, before a process is opened.** A script changed on the server after
+    # these settings were saved can carry a value that still parses while meaning
+    # another quantity or period in the new script; the backtest runs and the
+    # live order is sized by the new meaning. The check reads the same program
+    # file the run is about to load and lives on the server, so a start from the
+    # panel, a start from the schedule, a start put back after a restart and a
+    # start from another machine all pass through it. It refuses; it never
+    # rewrites: a start is not a save, and an automatic rewrite on the way to the
+    # market would size a position nobody confirmed.
+    stale = openscript_inputs.start_refusal(saved)
+    if stale:
+        return False, stale
 
     # **The deployment's own id, because that is what its books are filtered
     # on.** A run tags every order with this, and the deployment's orderbook,

@@ -30,7 +30,7 @@
  */
 
 import { Fragment, useId } from 'react'
-import { type InputDeclaration, defaultValueOf } from '@/lib/trading/backtestInputs'
+import { defaultValueOf, type InputDeclaration } from '@/lib/trading/backtestInputs'
 
 interface Props {
   declarations: readonly InputDeclaration[]
@@ -39,6 +39,11 @@ interface Props {
   onChange(key: string, value: string): void
   /** The sentence under the fields, which differs by where the form is used. */
   note?: string
+  /**
+   * Keys the input review marked for re-entry. Their controls are ringed, so
+   * the field to fix is the same one the review names, in the same form.
+   */
+  attentionKeys?: ReadonlySet<string>
 }
 
 /**
@@ -59,9 +64,10 @@ function groupsOf(declarations: readonly InputDeclaration[]): [string, InputDecl
   return [...out]
 }
 
-export function StrategyInputs({ declarations, edited, onChange, note }: Props) {
+export function StrategyInputs({ declarations, edited, onChange, note, attentionKeys }: Props) {
   const idBase = useId()
   if (declarations.length === 0) return null
+  const attention = attentionKeys ?? new Set<string>()
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -83,6 +89,7 @@ export function StrategyInputs({ declarations, edited, onChange, note }: Props) 
                   edited={edited}
                   onChange={onChange}
                   helpId={helpId}
+                  attention={attention.has(one.key)}
                 />
                 {one.tooltip && (
                   <p id={helpId} className="text-[10px] leading-snug text-muted-foreground">
@@ -109,13 +116,24 @@ function InputRow({
   edited,
   onChange,
   helpId,
+  attention,
 }: {
   one: InputDeclaration
   fallback: ReturnType<typeof defaultValueOf>
   edited: Readonly<Record<string, string>>
   onChange(key: string, value: string): void
   helpId: string | undefined
+  attention: boolean
 }) {
+  // Ringed while the input review says this one has to be set again, so the
+  // field that needs work is the field under the cursor's row.
+  const controlClass = attention
+    ? 'h-7 w-28 rounded border border-destructive/60 bg-destructive/5 px-1 text-[11px] text-foreground'
+    : 'h-7 w-28 rounded border border-border bg-background px-1 text-[11px]'
+  const textClass = attention
+    ? 'h-7 w-28 rounded border border-destructive/60 bg-destructive/5 px-1.5 text-[11px] text-foreground'
+    : 'h-7 w-28 rounded border border-border bg-background px-1.5 text-[11px]'
+
   return (
     <label className="flex items-center gap-1.5">
       <span className="flex-1 truncate text-[11px]" title={one.label}>
@@ -124,20 +142,22 @@ function InputRow({
 
       {one.kind === 'bool' ? (
         <select
-          className="h-7 w-28 rounded border border-border bg-background px-1 text-[11px]"
+          className={controlClass}
           value={edited[one.key] ?? String(fallback ?? 'false')}
           onChange={(e) => onChange(one.key, e.target.value)}
           aria-describedby={helpId}
+          aria-invalid={attention || undefined}
         >
           <option value="true">true</option>
           <option value="false">false</option>
         </select>
       ) : one.options && one.options.length > 0 ? (
         <select
-          className="h-7 w-28 rounded border border-border bg-background px-1 text-[11px]"
+          className={controlClass}
           value={edited[one.key] ?? String(fallback ?? '')}
           onChange={(e) => onChange(one.key, e.target.value)}
           aria-describedby={helpId}
+          aria-invalid={attention || undefined}
         >
           {one.options.map((option) => (
             <option key={String(option)} value={String(option)}>
@@ -148,7 +168,7 @@ function InputRow({
       ) : (
         <input
           type={one.kind === 'number' ? 'number' : 'text'}
-          className="h-7 w-28 rounded border border-border bg-background px-1.5 text-[11px]"
+          className={textClass}
           placeholder={fallback === null ? '' : String(fallback)}
           value={edited[one.key] ?? ''}
           min={one.min ?? undefined}
@@ -156,6 +176,7 @@ function InputRow({
           step={one.step ?? undefined}
           onChange={(e) => onChange(one.key, e.target.value)}
           aria-describedby={helpId}
+          aria-invalid={attention || undefined}
         />
       )}
     </label>

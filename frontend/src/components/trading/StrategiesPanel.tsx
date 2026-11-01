@@ -39,10 +39,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   clearSettings,
   closeStrategy,
+  type InputReview,
   overview,
   pauseStrategy,
+  RunnerError,
   type RunningStrategy,
   type RunSettings,
+  reviewSettings,
   saveSettings,
   startStrategy,
   strategyPositions,
@@ -57,6 +60,7 @@ import { quantityNote, quantityOf } from '@/lib/trading/strategyQuantity'
 import { cn } from '@/lib/utils'
 import { useThemeStore } from '@/stores/themeStore'
 import { ConfirmStop } from './ConfirmStop'
+import { InputReviewView } from './InputReviewView'
 import { InstrumentPicker } from './InstrumentPicker'
 import { PANEL_HEADER, PanelShell } from './panelShell'
 import { StrategyBooks } from './StrategyBooks'
@@ -230,6 +234,11 @@ function DeploymentForm({
   onRemove,
   busy,
   saveLabel,
+  review,
+  reviewTouched,
+  onTouchKey,
+  onConfirmReview,
+  onCancelReview,
 }: {
   draft: RunSettings
   setDraft(next: RunSettings): void
@@ -242,6 +251,12 @@ function DeploymentForm({
   onRemove: (() => void) | null
   busy: boolean
   saveLabel: string
+  /** The server's item by item review of the inputs against the saved script. */
+  review: InputReview | null
+  reviewTouched: ReadonlySet<string>
+  onTouchKey(key: string): void
+  onConfirmReview(): void
+  onCancelReview(): void
 }) {
   const ready = Boolean(
     draft.file && draft.symbol.trim() && draft.exchange.trim() && draft.interval.trim()
@@ -259,9 +274,23 @@ function DeploymentForm({
       <StrategyInputs
         declarations={declarations}
         edited={typed}
-        onChange={(key, value) => setTyped((held) => ({ ...held, [key]: value }))}
+        attentionKeys={new Set(review?.reset.map((one) => one.key) ?? [])}
+        onChange={(key, value) => {
+          setTyped((held) => ({ ...held, [key]: value }))
+          onTouchKey(key)
+        }}
         note="A box left empty uses the script's own default. A running strategy reads these when it starts, so stop it and start it again to apply a change."
       />
+
+      {review && (
+        <InputReviewView
+          review={review}
+          touched={reviewTouched}
+          busy={busy}
+          onConfirm={onConfirmReview}
+          onCancel={onCancelReview}
+        />
+      )}
 
       {sizeNote && <p className="text-[10px] leading-relaxed text-muted-foreground">{sizeNote}</p>}
 
@@ -271,33 +300,37 @@ function DeploymentForm({
         running is left exactly where it is.
       </p>
 
-      <div className="flex gap-1.5">
-        <button
-          type="button"
-          className="h-7 flex-1 rounded border border-border text-[11px] hover:bg-accent disabled:opacity-50"
-          disabled={busy || !ready}
-          title={ready ? undefined : 'An instrument, an exchange and an interval are needed'}
-          onClick={onSave}
-        >
-          {saveLabel}
-        </button>
-        <button
-          type="button"
-          className="h-7 rounded border border-border px-2 text-[11px] hover:bg-accent"
-          onClick={onCancel}
-        >
-          Cancel
-        </button>
-        {onRemove && (
+      {/* While a review is open its own buttons do the save and the cancel; a
+          second Save beside them would ask the same question twice. */}
+      {!review && (
+        <div className="flex gap-1.5">
           <button
             type="button"
-            className="h-7 rounded border border-border px-2 text-[11px] text-muted-foreground hover:border-destructive/50 hover:text-destructive"
-            onClick={onRemove}
+            className="h-7 flex-1 rounded border border-border text-[11px] hover:bg-accent disabled:opacity-50"
+            disabled={busy || !ready}
+            title={ready ? undefined : 'An instrument, an exchange and an interval are needed'}
+            onClick={onSave}
           >
-            Remove
+            {saveLabel}
           </button>
-        )}
-      </div>
+          <button
+            type="button"
+            className="h-7 rounded border border-border px-2 text-[11px] hover:bg-accent"
+            onClick={onCancel}
+          >
+            Cancel
+          </button>
+          {onRemove && (
+            <button
+              type="button"
+              className="h-7 rounded border border-border px-2 text-[11px] text-muted-foreground hover:border-destructive/50 hover:text-destructive"
+              onClick={onRemove}
+            >
+              Remove
+            </button>
+          )}
+        </div>
+      )}
     </>
   )
 }
@@ -332,6 +365,16 @@ export function StrategiesPanel({ getChartContext }: Props) {
   const [declarations, setDeclarations] = useState<InputDeclaration[]>([])
   const [typed, setTyped] = useState<Record<string, string>>({})
   const [sizeNote, setSizeNote] = useState('')
+  /**
+   * The server's review of the saved inputs against the script declared now.
+   *
+   * Held for the deployment editor and nowhere else: the check itself runs on
+   * the server at save and again at every start, so this copy is only what the
+   * open form is showing. `reviewTouched` names the fields the trader has set
+   * since the review came back, which is what lets the confirming save enable.
+   */
+  const [review, setReview] = useState<InputReview | null>(null)
+  const [reviewTouched, setReviewTouched] = useState<ReadonlySet<string>>(new Set())
   const [unreachable, setUnreachable] = useState(false)
   /**
    * Which deployment has been asked to stop and is waiting to be confirmed.
@@ -571,6 +614,8 @@ export function StrategiesPanel({ getChartContext }: Props) {
       // set until it does, and the editor where it is fixed says why.
       setDeclarations([])
       setSizeNote('')
+      setReview(null)
+      setReviewTouched(new Set())
       void (async () => {
         try {
           const source = await readScript(script)
@@ -585,8 +630,59 @@ export function StrategiesPanel({ getChartContext }: Props) {
           // taking the whole editor down over the parameters would stop that.
         }
       })()
+
+      // The server's review of what is saved against the program on disk now,
+      // shown in this same form before anything is saved or started. A clean
+      // review shows nothing; a difference lists itself. Failures here are
+      // silent: the same check runs on the save and refuses there, so a review
+      // that cannot be fetched only loses the early warning, not the gate.
+      if (at !== NEW) {
+        void reviewSettings(at)
+          .then((found) => {
+            if (live.current) setReview(found.changed ? found : null)
+          })
+          .catch(() => undefined)
+      }
     },
     [getChartContext, settings]
+  )
+
+  /**
+   * Save the open deployment once, through the server's review.
+   *
+   * The first attempt only reports: a script changed under a carried value
+   * answers 409 with the item by item review, and the form stays open listing
+   * it. The confirming attempt writes once; anything still invalid answers 400
+   * and names it. Neither refusal changed the saved settings.
+   */
+  const saveDeployment = useCallback(
+    async (id: string, confirm: boolean) => {
+      if (!draft) return
+      setBusy(id)
+      setProblem(null)
+      try {
+        await saveSettings({ ...draft, inputs: settingsFromForm(declarations, typed) }, confirm)
+        setReview(null)
+        setReviewTouched(new Set())
+        setEditing(null)
+        await refresh()
+        setRevision((n) => n + 1)
+      } catch (error) {
+        if (error instanceof RunnerError && error.review) {
+          setReview(error.review)
+          setReviewTouched(new Set())
+          // A 409 is the review asking for confirmation, not a fault. A 400
+          // means the reviewed values still do not pass, which is a fault the
+          // sentence has to name in addition to the list.
+          if (error.status !== 409) setProblem(error.message)
+        } else {
+          setProblem(error instanceof Error ? error.message : String(error))
+        }
+      } finally {
+        setBusy(null)
+      }
+    },
+    [draft, declarations, typed, refresh]
   )
 
   return (
@@ -660,12 +756,15 @@ export function StrategiesPanel({ getChartContext }: Props) {
             typed={typed}
             setTyped={setTyped}
             sizeNote={sizeNote}
-            onSave={() =>
-              void act(NEW, async () => {
-                await saveSettings({ ...draft, inputs: settingsFromForm(declarations, typed) })
-                setEditing(null)
-              })
-            }
+            review={review}
+            reviewTouched={reviewTouched}
+            onTouchKey={(key) => setReviewTouched((held) => new Set(held).add(key))}
+            onConfirmReview={() => void saveDeployment(NEW, true)}
+            onCancelReview={() => {
+              setReview(null)
+              setReviewTouched(new Set())
+            }}
+            onSave={() => void saveDeployment(NEW, false)}
             onCancel={() => setEditing(null)}
             onRemove={null}
             busy={busy === NEW}
@@ -770,19 +869,15 @@ export function StrategiesPanel({ getChartContext }: Props) {
                       typed={typed}
                       setTyped={setTyped}
                       sizeNote={sizeNote}
-                      onSave={() =>
-                        void act(one.id, async () => {
-                          // The same reader the backtest panel uses, so a value
-                          // this accepts is one that panel accepted: a strategy
-                          // must not trade live on a number its own backtest
-                          // would have refused.
-                          await saveSettings({
-                            ...draft,
-                            inputs: settingsFromForm(declarations, typed),
-                          })
-                          setEditing(null)
-                        })
-                      }
+                      review={review}
+                      reviewTouched={reviewTouched}
+                      onTouchKey={(key) => setReviewTouched((held) => new Set(held).add(key))}
+                      onConfirmReview={() => void saveDeployment(one.id, true)}
+                      onCancelReview={() => {
+                        setReview(null)
+                        setReviewTouched(new Set())
+                      }}
+                      onSave={() => void saveDeployment(one.id, false)}
                       onCancel={() => setEditing(null)}
                       onRemove={
                         held
