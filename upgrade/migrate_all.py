@@ -85,6 +85,7 @@ MIGRATIONS = [
     ("migrate_gtt_sandbox.py", "Sandbox GTT Support & CAS F&O Close (15:40)"),
     ("migrate_historify_drop_indexes.py", "Historify Unused Index Removal (#1779)"),
     ("migrate_historify_sequences.py", "Historify ID Sequences"),
+    ("migrate_historify_bundle.py", "Historify Migration Bundle Restore (job_items.interval)"),
     ("migrate_watchlist.py", "Charting Terminal Watchlists"),
     ("migrate_strategy_module.py", "Strategy Module (multi-leg options + RMS)"),
     ("migrate_strategy_universe_tab.py", "Strategy Module Universe Tab Normalization"),

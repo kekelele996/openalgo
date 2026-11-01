@@ -618,6 +618,184 @@ def download_bulk_export():
 
 
 # =============================================================================
+# Migration Bundle Endpoints (machine-to-machine transfer)
+# =============================================================================
+
+
+@historify_bp.route("/api/migrate/bundle", methods=["POST"])
+@check_session_validity
+def create_migration_bundle():
+    """Package selected stored symbols/intervals/date range into one .hbpkg."""
+    try:
+        from datetime import datetime
+
+        from database.historify_db import BUNDLE_INTERVALS, build_migration_bundle
+
+        data = request.get_json()
+        symbols = data.get("symbols")  # None/omitted means every catalog symbol
+        intervals = data.get("intervals") or list(BUNDLE_INTERVALS)
+        start_date = data.get("start_date")
+        end_date = data.get("end_date")
+
+        if not isinstance(intervals, list) or not intervals:
+            return jsonify({"status": "error", "message": "intervals must be a non-empty array"}), 400
+        invalid = [i for i in intervals if i not in BUNDLE_INTERVALS]
+        if invalid:
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "message": f"Only stored intervals can be bundled: {invalid}",
+                    }
+                ),
+                400,
+            )
+        if symbols is not None and (
+            not isinstance(symbols, list)
+            or any(not s.get("symbol") or not s.get("exchange") for s in symbols)
+        ):
+            return jsonify({"status": "error", "message": "symbols must be a list of {symbol, exchange}"}), 400
+
+        start_timestamp = None
+        end_timestamp = None
+        if start_date:
+            start_timestamp = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp())
+        if end_date:
+            end_timestamp = int(datetime.strptime(end_date, "%Y-%m-%d").timestamp()) + 86400
+
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bundle_id = uuid.uuid4().hex[:10]
+        if symbols and len(symbols) == 1:
+            base_name = f"historify_bundle_{symbols[0]['symbol']}_{timestamp_str}_{bundle_id}"
+        else:
+            base_name = f"historify_bundle_{timestamp_str}_{bundle_id}"
+        output_path = os.path.join(tempfile.gettempdir(), f"{base_name}.hbpkg")
+
+        success, message, summary = build_migration_bundle(
+            output_path=output_path,
+            symbols=symbols,
+            intervals=intervals,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        )
+        if not success:
+            return jsonify({"status": "error", "message": message}), 400
+
+        session["migration_bundle_file"] = output_path
+        session["migration_bundle_name"] = f"{base_name}.hbpkg"
+        return jsonify(
+            {
+                "status": "success",
+                "message": message,
+                "filename": f"{base_name}.hbpkg",
+                "summary": summary,
+            }
+        ), 200
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    except Exception as e:
+        logger.exception(f"Error creating migration bundle: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@historify_bp.route("/api/migrate/bundle/download", methods=["GET"])
+@check_session_validity
+def download_migration_bundle():
+    """Stream the freshly built .hbpkg and remove it afterwards."""
+    file_path = None
+    try:
+        file_path = session.get("migration_bundle_file")
+        filename = session.get("migration_bundle_name", "historify_bundle.hbpkg")
+
+        if not file_path or not os.path.exists(file_path):
+            return jsonify({"status": "error", "message": "Bundle file not found"}), 404
+
+        temp_dir = tempfile.gettempdir()
+        abs_path = os.path.abspath(file_path)
+        if not abs_path.startswith(os.path.abspath(temp_dir)):
+            return jsonify({"status": "error", "message": "Invalid file path"}), 400
+
+        session.pop("migration_bundle_file", None)
+        session.pop("migration_bundle_name", None)
+
+        def generate_and_cleanup():
+            try:
+                with open(file_path, "rb") as fh:
+                    while True:
+                        chunk = fh.read(65536)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                except OSError:
+                    pass
+
+        return Response(
+            generate_and_cleanup(),
+            mimetype="application/zip",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    except Exception as e:
+        logger.exception(f"Error downloading migration bundle: {e}")
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@historify_bp.route("/api/migrate/upload", methods=["POST"])
+@check_session_validity
+def upload_migration_bundle():
+    """Stage a .hbpkg and answer with its new/existing segment preview."""
+    try:
+        from services.historify_service import save_migration_bundle
+
+        if "file" not in request.files:
+            return jsonify({"status": "error", "message": "No file provided"}), 400
+        file = request.files["file"]
+        if not file.filename:
+            return jsonify({"status": "error", "message": "No file selected"}), 400
+        if not file.filename.lower().endswith(".hbpkg"):
+            return jsonify({"status": "error", "message": "Migration bundles must be .hbpkg files"}), 400
+
+        success, response, status_code = save_migration_bundle(file)
+        return jsonify(response), status_code
+    except Exception as e:
+        logger.exception(f"Error uploading migration bundle: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@historify_bp.route("/api/migrate/restore", methods=["POST"])
+@check_session_validity
+def restore_migration_bundle():
+    """Confirm a staged bundle and start its resumable restore job."""
+    try:
+        from services.historify_service import start_bundle_restore
+
+        data = request.get_json() or {}
+        bundle_id = data.get("bundle_id")
+        segment_ids = data.get("segment_ids")
+
+        if not bundle_id:
+            return jsonify({"status": "error", "message": "bundle_id is required"}), 400
+        if segment_ids is not None and (
+            not isinstance(segment_ids, list) or not all(isinstance(s, str) for s in segment_ids)
+        ):
+            return jsonify({"status": "error", "message": "segment_ids must be an array of strings"}), 400
+
+        success, response, status_code = start_bundle_restore(bundle_id, segment_ids)
+        return jsonify(response), status_code
+    except Exception as e:
+        logger.exception(f"Error starting migration restore: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# =============================================================================
 # Utility Endpoints
 # =============================================================================
 
@@ -1125,19 +1303,24 @@ def retry_job(job_id):
     """Retry failed items in a job."""
     try:
         from database.auth_db import get_api_key_for_tradingview
-        from services.historify_service import retry_failed_items
+        from database.historify_db import get_download_job
+        from services.historify_service import BUNDLE_RESTORE_JOB_TYPE, retry_failed_items
 
-        # Get API key for the logged-in user
-        user = session.get("user")
-        api_key = get_api_key_for_tradingview(user)
-
-        if not api_key:
-            return jsonify(
-                {
-                    "status": "error",
-                    "message": "No API key found. Please generate an API key first.",
-                }
-            ), 400
+        # Bundle restores read local files only; broker downloads need a key.
+        job = get_download_job(job_id)
+        api_key = None
+        if not job:
+            return jsonify({"status": "error", "message": "Job not found"}), 404
+        if job.get("job_type") != BUNDLE_RESTORE_JOB_TYPE:
+            user = session.get("user")
+            api_key = get_api_key_for_tradingview(user)
+            if not api_key:
+                return jsonify(
+                    {
+                        "status": "error",
+                        "message": "No API key found. Please generate an API key first.",
+                    }
+                ), 400
 
         success, response, status_code = retry_failed_items(job_id, api_key)
         return jsonify(response), status_code

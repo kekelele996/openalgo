@@ -12,6 +12,7 @@ import {
   Loader2,
   LogOut,
   Moon,
+  Package,
   Pause,
   Play,
   Plus,
@@ -185,6 +186,44 @@ interface JobProgress {
   percent: number
 }
 
+/** One (symbol, exchange, interval) segment as previewed from an .hbpkg. */
+interface BundleSegmentPreviewRow {
+  segment_id: string
+  symbol: string
+  exchange: string
+  interval: string
+  bundle_first: number
+  bundle_last: number
+  bundle_records: number
+  total: number
+  existing: number
+  new: number
+  state: 'new' | 'partial' | 'existing'
+  local_first: number | null
+  local_last: number | null
+  local_count: number
+}
+
+interface BundlePreview {
+  segments: BundleSegmentPreviewRow[]
+  totals: {
+    segments: number
+    total_records: number
+    new_records: number
+    existing_records: number
+  }
+}
+
+/** Server response after an .hbpkg is staged. */
+interface BundleUploadResponse {
+  status: string
+  bundle_id?: string
+  created_at?: string
+  source?: { hostname?: string }
+  preview?: BundlePreview
+  message?: string
+}
+
 interface Stats {
   database_size_mb: number
   total_records: number
@@ -251,6 +290,18 @@ function getDateFromPreset(months: number): string {
   const d = new Date()
   d.setMonth(d.getMonth() - months)
   return d.toISOString().split('T')[0]
+}
+
+/**
+ * Format an epoch-seconds timestamp as an IST calendar day.
+ *
+ * Stored daily candles carry a 00:00 IST timestamp (18:30 UTC the previous
+ * day), so a UTC slice would label every daily row one day early. The +5:30
+ * shift matches how the backend catalog renders first/last dates.
+ */
+function formatBundleDay(epochSeconds: number | null): string {
+  if (epochSeconds === null || epochSeconds === undefined) return '—'
+  return new Date((epochSeconds + 19800) * 1000).toISOString().slice(0, 10)
 }
 
 export default function Historify() {
@@ -380,6 +431,19 @@ export default function Historify() {
   // Custom export interval state
   const [customExportValue, setCustomExportValue] = useState('25')
   const [customExportUnit, setCustomExportUnit] = useState<'m' | 'h' | 'W' | 'M' | 'Q' | 'Y'>('m')
+
+  // Migration bundle (machine-to-machine transfer) state
+  const [bundleDialogOpen, setBundleDialogOpen] = useState(false)
+  const [bundleSymbols, setBundleSymbols] = useState<'all' | 'selected'>('selected')
+  const [bundleIntervals, setBundleIntervals] = useState<Set<string>>(new Set(['1m', 'D']))
+  const [bundleStart, setBundleStart] = useState('')
+  const [bundleEnd, setBundleEnd] = useState('')
+  const [isBundling, setIsBundling] = useState(false)
+  // Restore side: mode toggle lives inside the existing Import dialog.
+  const [importMode, setImportMode] = useState<'file' | 'bundle'>('file')
+  const [isBundleUploading, setIsBundleUploading] = useState(false)
+  const [bundleUpload, setBundleUpload] = useState<BundleUploadResponse | null>(null)
+  const [isRestoring, setIsRestoring] = useState(false)
 
   // Watchlist selection state (for downloading specific symbols)
   const [watchlistSelectedSymbols, setWatchlistSelectedSymbols] = useState<Set<string>>(new Set())
@@ -1431,6 +1495,124 @@ export default function Historify() {
     }
   }
 
+  // --- Migration bundle: package -------------------------------------------
+  const handleCreateBundle = async () => {
+    if (bundleIntervals.size === 0) {
+      showToast.warning('Select at least one stored interval (1m or D)', 'historify')
+      return
+    }
+    if (bundleSymbols === 'selected' && catalogSelectedSymbols.size === 0) {
+      showToast.warning('Select symbols in the data list first', 'historify')
+      return
+    }
+    setIsBundling(true)
+    try {
+      const csrfToken = await fetchCSRFToken()
+      const symbols =
+        bundleSymbols === 'selected'
+          ? Array.from(catalogSelectedSymbols).map((key) => {
+              const [symbol, exchange] = key.split(':')
+              return { symbol, exchange }
+            })
+          : null
+      const response = await fetch('/historify/api/migrate/bundle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+        credentials: 'include',
+        body: JSON.stringify({
+          symbols,
+          intervals: Array.from(bundleIntervals),
+          ...(bundleStart ? { start_date: bundleStart } : {}),
+          ...(bundleEnd ? { end_date: bundleEnd } : {}),
+        }),
+      })
+      const data = await response.json()
+      if (data.status === 'success') {
+        showToast.success(data.message, 'historify')
+        window.location.href = '/historify/api/migrate/bundle/download'
+        setBundleDialogOpen(false)
+      } else {
+        showToast.error(data.message || 'Failed to build bundle', 'historify')
+      }
+    } catch (_error) {
+      showToast.error('Failed to build bundle', 'historify')
+    } finally {
+      setIsBundling(false)
+    }
+  }
+
+  // --- Migration bundle: restore -------------------------------------------
+  const resetBundleImport = () => {
+    setBundleUpload(null)
+    setIsBundleUploading(false)
+    setIsRestoring(false)
+  }
+
+  const openImportDialog = (mode: 'file' | 'bundle') => {
+    setImportMode(mode)
+    resetBundleImport()
+    setUploadDialogOpen(true)
+  }
+
+  const handleBundleFileSelected = async (file: File) => {
+    setBundleUpload(null)
+    setIsBundleUploading(true)
+    try {
+      const csrfToken = await fetchCSRFToken()
+      const formData = new FormData()
+      formData.append('file', file)
+      const response = await fetch('/historify/api/migrate/upload', {
+        method: 'POST',
+        headers: { 'X-CSRFToken': csrfToken },
+        credentials: 'include',
+        body: formData,
+      })
+      const data: BundleUploadResponse = await response.json()
+      if (data.status === 'success' && data.preview) {
+        setBundleUpload(data)
+      } else {
+        showToast.error(data.message || 'Could not read migration bundle', 'historify')
+      }
+    } catch (_error) {
+      showToast.error('Failed to upload migration bundle', 'historify')
+    } finally {
+      setIsBundleUploading(false)
+    }
+  }
+
+  const handleConfirmRestore = async () => {
+    const bundleId = bundleUpload?.bundle_id
+    const preview = bundleUpload?.preview
+    if (!bundleId || !preview) return
+    setIsRestoring(true)
+    try {
+      const csrfToken = await fetchCSRFToken()
+      const response = await fetch('/historify/api/migrate/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+        credentials: 'include',
+        body: JSON.stringify({ bundle_id: bundleId }),
+      })
+      const data = await response.json()
+      if (data.status === 'success') {
+        showToast.success(
+          `Restore started: ${preview.totals.segments} segment(s), ${preview.totals.new_records.toLocaleString()} new records`,
+          'historify'
+        )
+        setUploadDialogOpen(false)
+        resetBundleImport()
+        setActiveTab('jobs')
+        loadJobs()
+      } else {
+        showToast.error(data.message || 'Failed to start restore', 'historify')
+      }
+    } catch (_error) {
+      showToast.error('Failed to start restore', 'historify')
+    } finally {
+      setIsRestoring(false)
+    }
+  }
+
   // Helper functions
   const toggleCatalogSymbol = (symbol: string, exchange: string) => {
     const key = `${symbol}:${exchange}`
@@ -1856,7 +2038,18 @@ export default function Historify() {
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={() => setUploadDialogOpen(true)}
+                          onClick={() => setBundleDialogOpen(true)}
+                          disabled={catalog.length === 0}
+                          className="h-9"
+                          title="Package selected symbols and time range into one migration bundle (.hbpkg)"
+                        >
+                          <Package className="h-4 w-4 mr-1" />
+                          Bundle
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => openImportDialog('file')}
                           className="h-9"
                         >
                           <Upload className="h-4 w-4 mr-1" />
@@ -2414,7 +2607,9 @@ export default function Historify() {
                                       />
                                       <span className="font-medium truncate">Job {job.id}</span>
                                       <Badge variant="outline" className="text-xs">
-                                        {job.job_type}
+                                        {job.job_type === 'bundle_restore'
+                                          ? 'restore'
+                                          : job.job_type}
                                       </Badge>
                                       <Badge
                                         variant={
@@ -2430,7 +2625,9 @@ export default function Historify() {
                                       </Badge>
                                     </div>
                                     <div className="text-sm text-muted-foreground">
-                                      {job.interval} | {job.start_date} to {job.end_date}
+                                      {job.job_type === 'bundle_restore'
+                                        ? `Migration bundle · ${job.total_symbols} segment(s) · ${job.start_date} to ${job.end_date}`
+                                        : `${job.interval} | ${job.start_date} to ${job.end_date}`}
                                     </div>
                                     <div className="flex items-center gap-4 mt-2 text-sm">
                                       <span className="flex items-center gap-1">
@@ -3014,89 +3211,400 @@ NIFTY24DEC25000CE,NFO"
         </DialogContent>
       </Dialog>
 
-      {/* Upload Dialog */}
-      <Dialog open={uploadDialogOpen} onOpenChange={setUploadDialogOpen}>
-        <DialogContent className="sm:max-w-md">
+      {/* Import Dialog: single CSV/Parquet or a migration bundle restore */}
+      <Dialog
+        open={uploadDialogOpen}
+        onOpenChange={(open) => {
+          setUploadDialogOpen(open)
+          if (!open) resetBundleImport()
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Import Data</DialogTitle>
-            <DialogDescription>Upload a CSV or Parquet file with OHLCV data</DialogDescription>
+            <DialogDescription>
+              Upload one CSV/Parquet file, or restore a migration bundle from another machine
+            </DialogDescription>
           </DialogHeader>
-          <div className="space-y-4">
-            <div>
-              <Label>Symbol</Label>
-              <Input
-                value={uploadSymbol}
-                onChange={(e) => setUploadSymbol(e.target.value.toUpperCase())}
-                placeholder="RELIANCE"
-                className="mt-1"
-              />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <Label>Exchange</Label>
-                <Select value={uploadExchange} onValueChange={setUploadExchange}>
-                  <SelectTrigger className="mt-1">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {exchanges.map((ex) => (
-                      <SelectItem key={ex} value={ex}>
-                        {ex}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+
+          {/* Mode switch, styled as a two-option segmented control */}
+          <div className="flex gap-1 p-1 bg-muted rounded-md w-fit">
+            <button
+              type="button"
+              onClick={() => setImportMode('file')}
+              className={cn(
+                'px-3 py-1 text-sm rounded-sm transition-colors',
+                importMode === 'file'
+                  ? 'bg-background shadow-sm font-medium'
+                  : 'text-muted-foreground'
+              )}
+            >
+              CSV / Parquet
+            </button>
+            <button
+              type="button"
+              onClick={() => setImportMode('bundle')}
+              className={cn(
+                'px-3 py-1 text-sm rounded-sm transition-colors',
+                importMode === 'bundle'
+                  ? 'bg-background shadow-sm font-medium'
+                  : 'text-muted-foreground'
+              )}
+            >
+              Migration Bundle (.hbpkg)
+            </button>
+          </div>
+
+          {importMode === 'file' ? (
+            <>
+              <div className="space-y-4">
+                <div>
+                  <Label>Symbol</Label>
+                  <Input
+                    value={uploadSymbol}
+                    onChange={(e) => setUploadSymbol(e.target.value.toUpperCase())}
+                    placeholder="RELIANCE"
+                    className="mt-1"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <Label>Exchange</Label>
+                    <Select value={uploadExchange} onValueChange={setUploadExchange}>
+                      <SelectTrigger className="mt-1">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {exchanges.map((ex) => (
+                          <SelectItem key={ex} value={ex}>
+                            {ex}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div>
+                    <Label>Interval</Label>
+                    <Select value={uploadInterval} onValueChange={setUploadInterval}>
+                      <SelectTrigger className="mt-1">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(historifyIntervals?.storage_intervals || ['1m', 'D']).map((int) => (
+                          <SelectItem key={int} value={int}>
+                            {int === '1m' ? '1 Minute' : int === 'D' ? 'Daily' : int}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Only 1min and Daily data can be stored
+                    </p>
+                  </div>
+                </div>
+                <div>
+                  <Label>Data File</Label>
+                  <Input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".csv,.parquet"
+                    onChange={handleFileChange}
+                    className="mt-1"
+                  />
+                  {uploadFile && (
+                    <p className="text-sm text-muted-foreground mt-1">
+                      Selected: {uploadFile.name}
+                    </p>
+                  )}
+                  <p className="text-xs text-muted-foreground mt-2">
+                    Download sample:{' '}
+                    <a href="/historify/api/sample/csv" className="text-primary hover:underline">
+                      CSV
+                    </a>
+                    {' | '}
+                    <a
+                      href="/historify/api/sample/parquet"
+                      className="text-primary hover:underline"
+                    >
+                      Parquet
+                    </a>
+                  </p>
+                </div>
               </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setUploadDialogOpen(false)}>
+                  Cancel
+                </Button>
+                <Button onClick={uploadCSVData} disabled={isUploading}>
+                  {isUploading && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
+                  Upload
+                </Button>
+              </DialogFooter>
+            </>
+          ) : (
+            <div className="space-y-4">
               <div>
-                <Label>Interval</Label>
-                <Select value={uploadInterval} onValueChange={setUploadInterval}>
-                  <SelectTrigger className="mt-1">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {(historifyIntervals?.storage_intervals || ['1m', 'D']).map((int) => (
-                      <SelectItem key={int} value={int}>
-                        {int === '1m' ? '1 Minute' : int === 'D' ? 'Daily' : int}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <Label>Migration Bundle</Label>
+                <Input
+                  type="file"
+                  accept=".hbpkg"
+                  className="mt-1"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0]
+                    if (file) {
+                      if (file.name.toLowerCase().endsWith('.hbpkg')) {
+                        handleBundleFileSelected(file)
+                      } else {
+                        showToast.error('Please select an .hbpkg migration bundle', 'historify')
+                      }
+                    }
+                  }}
+                />
                 <p className="text-xs text-muted-foreground mt-1">
-                  Only 1min and Daily data can be stored
+                  Created on the source machine with the Bundle button in the data list. Uploading
+                  only previews — nothing is written until you confirm.
                 </p>
               </div>
-            </div>
-            <div>
-              <Label>Data File</Label>
-              <Input
-                ref={fileInputRef}
-                type="file"
-                accept=".csv,.parquet"
-                onChange={handleFileChange}
-                className="mt-1"
-              />
-              {uploadFile && (
-                <p className="text-sm text-muted-foreground mt-1">Selected: {uploadFile.name}</p>
+
+              {isBundleUploading && (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Reading bundle and comparing with local data...
+                </div>
               )}
-              <p className="text-xs text-muted-foreground mt-2">
-                Download sample:{' '}
-                <a href="/historify/api/sample/csv" className="text-primary hover:underline">
-                  CSV
-                </a>
-                {' | '}
-                <a href="/historify/api/sample/parquet" className="text-primary hover:underline">
-                  Parquet
-                </a>
+
+              {bundleUpload?.preview && (
+                <>
+                  <div className="flex items-center justify-between bg-muted/60 rounded-lg p-3 text-sm">
+                    <span className="text-muted-foreground">
+                      {bundleUpload.source?.hostname
+                        ? `From ${bundleUpload.source.hostname}`
+                        : 'Migration bundle'}
+                    </span>
+                    <span className="font-medium">
+                      {bundleUpload.preview.totals.new_records.toLocaleString()} new /{' '}
+                      {bundleUpload.preview.totals.existing_records.toLocaleString()} already
+                      present
+                    </span>
+                  </div>
+                  <ScrollArea className="h-64 border rounded-md">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>Symbol</TableHead>
+                          <TableHead>Interval</TableHead>
+                          <TableHead>Status</TableHead>
+                          <TableHead>Bundle range</TableHead>
+                          <TableHead className="text-right">New</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {bundleUpload.preview.segments.map((row) => (
+                          <TableRow key={row.segment_id}>
+                            <TableCell className="font-medium">
+                              {row.symbol}
+                              <span className="ml-1 text-xs text-muted-foreground">
+                                {row.exchange}
+                              </span>
+                            </TableCell>
+                            <TableCell>
+                              <Badge
+                                variant={row.interval === '1m' ? 'default' : 'secondary'}
+                                className="text-xs"
+                              >
+                                {row.interval}
+                              </Badge>
+                            </TableCell>
+                            <TableCell>
+                              <Badge
+                                variant={
+                                  row.state === 'new'
+                                    ? 'default'
+                                    : row.state === 'partial'
+                                      ? 'secondary'
+                                      : 'outline'
+                                }
+                                className={cn(
+                                  'text-xs',
+                                  row.state === 'new' && 'bg-green-600 hover:bg-green-600'
+                                )}
+                                title={
+                                  row.state === 'existing'
+                                    ? `Local already covers all ${row.total.toLocaleString()} rows`
+                                    : row.state === 'partial'
+                                      ? `${row.existing.toLocaleString()} of ${row.total.toLocaleString()} rows already local`
+                                      : 'No matching local rows'
+                                }
+                              >
+                                {row.state === 'new'
+                                  ? 'NEW'
+                                  : row.state === 'partial'
+                                    ? 'PARTIAL'
+                                    : 'EXISTS'}
+                              </Badge>
+                            </TableCell>
+                            <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
+                              {formatBundleDay(row.bundle_first)}
+                              {' – '}
+                              {formatBundleDay(row.bundle_last)}
+                            </TableCell>
+                            <TableCell className="text-right font-medium">
+                              {row.new.toLocaleString()}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </ScrollArea>
+                </>
+              )}
+
+              <DialogFooter>
+                <Button
+                  variant="outline"
+                  onClick={() => setUploadDialogOpen(false)}
+                  disabled={isRestoring}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  onClick={handleConfirmRestore}
+                  disabled={
+                    isRestoring ||
+                    isBundleUploading ||
+                    !bundleUpload?.preview ||
+                    bundleUpload.preview.totals.new_records === 0
+                  }
+                  title={
+                    bundleUpload?.preview && bundleUpload.preview.totals.new_records === 0
+                      ? 'Every segment already exists locally'
+                      : undefined
+                  }
+                >
+                  {isRestoring && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
+                  Restore {bundleUpload?.preview?.totals.new_records.toLocaleString() ?? ''} records
+                </Button>
+              </DialogFooter>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Migration Bundle Dialog */}
+      <Dialog open={bundleDialogOpen} onOpenChange={setBundleDialogOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Create Migration Bundle</DialogTitle>
+            <DialogDescription>
+              Package selected symbols and stored timeframes into one .hbpkg file to restore on
+              another machine
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label>Symbols</Label>
+                <Select
+                  value={bundleSymbols}
+                  onValueChange={(v) => setBundleSymbols(v as 'all' | 'selected')}
+                >
+                  <SelectTrigger className="mt-1">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="selected">
+                      Selected ({catalogSelectedSymbols.size})
+                    </SelectItem>
+                    <SelectItem value="all">All ({groupedCatalog.length})</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <Label className="mb-1 block">Stored data</Label>
+                <div className="flex gap-2 mt-1">
+                  {(['1m', 'D'] as const).map((intv) => (
+                    <button
+                      key={intv}
+                      type="button"
+                      onClick={() =>
+                        setBundleIntervals((prev) => {
+                          const next = new Set(prev)
+                          if (next.has(intv)) next.delete(intv)
+                          else next.add(intv)
+                          return next
+                        })
+                      }
+                      className={cn(
+                        'flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-md border text-sm transition-colors',
+                        bundleIntervals.has(intv)
+                          ? 'bg-primary text-primary-foreground border-primary'
+                          : 'bg-muted/50 hover:bg-muted'
+                      )}
+                    >
+                      <Checkbox
+                        checked={bundleIntervals.has(intv)}
+                        className={cn(bundleIntervals.has(intv) && 'border-primary-foreground')}
+                        onClick={(e) => e.stopPropagation()}
+                        onCheckedChange={() =>
+                          setBundleIntervals((prev) => {
+                            const next = new Set(prev)
+                            if (next.has(intv)) next.delete(intv)
+                            else next.add(intv)
+                            return next
+                          })
+                        }
+                      />
+                      {intv === '1m' ? '1 Minute' : 'Daily'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label>From (optional)</Label>
+                <Input
+                  type="date"
+                  value={bundleStart}
+                  onChange={(e) => setBundleStart(e.target.value)}
+                  className="mt-1"
+                />
+              </div>
+              <div>
+                <Label>To (optional)</Label>
+                <Input
+                  type="date"
+                  value={bundleEnd}
+                  onChange={(e) => setBundleEnd(e.target.value)}
+                  className="mt-1"
+                />
+              </div>
+            </div>
+
+            <div className="bg-muted/50 rounded-lg p-3 text-xs text-muted-foreground space-y-1">
+              <p>
+                Only physically stored rows (1m and D) travel in the bundle; 5m/15m/1h/W/M and other
+                computed timeframes are re-derived automatically on the target machine.
               </p>
+              <p>Restore can be interrupted and resumed, and re-importing never duplicates rows.</p>
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setUploadDialogOpen(false)}>
+            <Button variant="outline" onClick={() => setBundleDialogOpen(false)}>
               Cancel
             </Button>
-            <Button onClick={uploadCSVData} disabled={isUploading}>
-              {isUploading && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
-              Upload
+            <Button
+              onClick={handleCreateBundle}
+              disabled={
+                isBundling ||
+                bundleIntervals.size === 0 ||
+                (bundleSymbols === 'selected' && catalogSelectedSymbols.size === 0)
+              }
+            >
+              {isBundling && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
+              <Package className="h-4 w-4 mr-1" />
+              Build bundle
             </Button>
           </DialogFooter>
         </DialogContent>

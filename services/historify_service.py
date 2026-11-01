@@ -2097,6 +2097,8 @@ def delete_job(job_id: str) -> tuple[bool, dict[str, Any], int]:
     Returns:
         Tuple of (success, response_data, status_code)
     """
+    import json
+
     from database.historify_db import delete_download_job, get_download_job
 
     try:
@@ -2111,9 +2113,19 @@ def delete_job(job_id: str) -> tuple[bool, dict[str, Any], int]:
                 400,
             )
 
+        bundle_id = None
+        if job.get("job_type") == BUNDLE_RESTORE_JOB_TYPE:
+            try:
+                bundle_id = (json.loads(job.get("config") or "{}")).get("bundle_id")
+            except (TypeError, ValueError):
+                bundle_id = None
+
         success, msg = delete_download_job(job_id)
 
         if success:
+            # The job was the last reference to the staged bundle files.
+            if bundle_id:
+                _remove_bundle_staging_if_orphaned(bundle_id)
             return True, {"status": "success", "message": msg}, 200
         else:
             return False, {"status": "error", "message": msg}, 500
@@ -2123,13 +2135,16 @@ def delete_job(job_id: str) -> tuple[bool, dict[str, Any], int]:
         return False, {"status": "error", "message": str(e)}, 500
 
 
-def retry_failed_items(job_id: str, api_key: str) -> tuple[bool, dict[str, Any], int]:
+def retry_failed_items(job_id: str, api_key: str | None = None) -> tuple[bool, dict[str, Any], int]:
     """
     Retry failed items in a job.
 
+    Broker download jobs need an API key; bundle_restore jobs read local files
+    and are dispatched to their own resumable processor without one.
+
     Args:
         job_id: Job identifier
-        api_key: OpenAlgo API key
+        api_key: OpenAlgo API key (not required for bundle restores)
 
     Returns:
         Tuple of (success, response_data, status_code)
@@ -2140,6 +2155,16 @@ def retry_failed_items(job_id: str, api_key: str) -> tuple[bool, dict[str, Any],
         job = get_download_job(job_id)
         if not job:
             return False, {"status": "error", "message": "Job not found"}, 404
+
+        if job.get("job_type") == BUNDLE_RESTORE_JOB_TYPE:
+            return _retry_bundle_restore(job_id)
+
+        if not api_key:
+            return (
+                False,
+                {"status": "error", "message": "No API key found. Please generate an API key first."},
+                400,
+            )
 
         if job["status"] == "running":
             return False, {"status": "error", "message": "Job is already running"}, 400
@@ -2199,6 +2224,624 @@ def retry_failed_items(job_id: str, api_key: str) -> tuple[bool, dict[str, Any],
     except Exception as e:
         logger.exception(f"Error retrying job: {e}")
         return False, {"status": "error", "message": str(e)}, 500
+
+
+# =============================================================================
+# Migration Bundle Operations (machine-to-machine transfer)
+# =============================================================================
+#
+# A bundle is produced by /api/migrate/bundle, carried to another machine as a
+# single .hbpkg file, uploaded once, previewed, and only then restored as a
+# resumable job. The restore processor below reuses the same download_jobs /
+# job_items tables, pause/cancel primitives and Socket.IO events as broker
+# downloads, so the existing Jobs tab tracks it without a parallel pipeline.
+
+BUNDLE_RESTORE_JOB_TYPE = "bundle_restore"
+
+#: Restored item status; mirrors the downloader's "downloading".
+BUNDLE_ITEM_ACTIVE_STATUS = "restoring"
+
+
+def _bundle_max_upload_bytes() -> int:
+    """Maximum accepted bundle upload size (default 2 GB)."""
+    return int(float(os.getenv("HISTORIFY_BUNDLE_MAX_MB", "2048")) * 1024 * 1024)
+
+
+def _sha256_file(path: str) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_extract_bundle(zip_path: str, dest_dir: str) -> list[str]:
+    """
+    Extract a migration bundle into ``dest_dir`` without trusting its entries.
+
+    Zip-slip, absolute paths, symlinks/hardlinks, unexpected members and
+    decompression bombs are all rejected. Only ``manifest.json`` and
+    ``data/<token>.parquet`` regular files are accepted. Returns the extracted
+    member names in archive order.
+    """
+    import zipfile
+
+    from database.historify_db import BUNDLE_DATA_PREFIX, BUNDLE_MANIFEST_NAME
+
+    max_members = int(os.getenv("HISTORIFY_BUNDLE_MAX_SEGMENTS", "10000")) + 1
+    max_extracted = int(
+        float(os.getenv("HISTORIFY_BUNDLE_MAX_EXTRACTED_MB", "8192")) * 1024 * 1024
+    )
+    real_dest = os.path.realpath(dest_dir)
+    extracted: list[str] = []
+    total_size = 0
+
+    with zipfile.ZipFile(zip_path) as zf:
+        members = zf.infolist()
+        if len(members) > max_members:
+            raise ValueError(f"Bundle contains too many entries ({len(members)})")
+        for member in members:
+            name = member.filename
+            if name.endswith("/"):
+                raise ValueError(f"Unsupported directory entry in bundle: {name}")
+            if member.is_dir():
+                raise ValueError(f"Unsupported directory entry in bundle: {name}")
+            # Reject Unix symlinks/hardlinks/devices. File-type bits of 0
+            # (DOS-sourced entries, or Python's writestr which stamps 0o600)
+            # and 0o100000 (regular file) are accepted; anything else is not.
+            unix_mode = (member.external_attr >> 16) & 0xFFFF
+            file_type_bits = unix_mode & 0o170000
+            if file_type_bits not in (0, 0o100000):
+                raise ValueError(f"Unsupported special file in bundle: {name}")
+            normalised_name = name.replace("\\", "/")
+            if (
+                os.path.isabs(name)
+                or normalised_name.startswith("/")
+                or ".." in normalised_name.split("/")
+            ):
+                raise ValueError(f"Unsafe path in bundle: {name}")
+
+            is_manifest = name == BUNDLE_MANIFEST_NAME
+            is_data = (
+                name.startswith(BUNDLE_DATA_PREFIX)
+                and "/" not in name[len(BUNDLE_DATA_PREFIX):]
+                and name[len(BUNDLE_DATA_PREFIX):].lower().endswith(".parquet")
+            )
+            if not is_manifest and not is_data:
+                raise ValueError(f"Unexpected entry in bundle: {name}")
+
+            total_size += member.file_size
+            if total_size > max_extracted:
+                raise ValueError("Bundle exceeds the maximum extracted size")
+
+            target = os.path.realpath(os.path.join(real_dest, name))
+            if not (target == real_dest or target.startswith(real_dest + os.sep)):
+                raise ValueError(f"Unsafe path in bundle: {name}")
+
+        zf.extractall(real_dest)
+        extracted = [m.filename for m in members if not m.is_dir()]
+    return extracted
+
+
+def _validate_manifest_segments(manifest: dict[str, Any]) -> None:
+    """Fail fast on a malformed manifest before previewing or restoring it."""
+    from database.historify_db import BUNDLE_FORMAT, BUNDLE_INTERVALS, BUNDLE_VERSION
+
+    if manifest.get("format") != BUNDLE_FORMAT:
+        raise ValueError("Not a Historify migration bundle")
+    if not isinstance(manifest.get("version"), int):
+        raise ValueError("Bundle manifest is missing its version")
+    if manifest["version"] > BUNDLE_VERSION:
+        raise ValueError(
+            f"Bundle version {manifest['version']} is newer than this installation supports"
+        )
+    segments = manifest.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise ValueError("Bundle manifest has no segments")
+
+    seen_keys: set[tuple[str, str, str]] = set()
+    for segment in segments:
+        for field in ("segment_id", "symbol", "exchange", "interval", "file", "sha256"):
+            if not isinstance(segment.get(field), str) or not segment[field]:
+                raise ValueError(f"Bundle segment is missing '{field}'")
+        for field in ("first_timestamp", "last_timestamp", "record_count"):
+            if not isinstance(segment.get(field), int) or segment[field] < 0:
+                raise ValueError(f"Bundle segment has invalid '{field}'")
+        if segment["interval"] not in BUNDLE_INTERVALS:
+            raise ValueError(
+                f"Bundle carries unsupported stored interval: {segment['interval']}"
+            )
+        key = (segment["symbol"], segment["exchange"], segment["interval"])
+        if key in seen_keys:
+            raise ValueError(f"Bundle lists a segment twice: {key}")
+        seen_keys.add(key)
+
+
+def _build_bundle_preview(bundle_id: str, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Preview every manifest segment against the local database."""
+    from database.historify_db import _segment_file_path, get_bundle_dir, preview_bundle_segment
+
+    bundle_dir = get_bundle_dir(bundle_id)
+    if bundle_dir is None:
+        raise ValueError("Bundle directory unavailable")
+
+    rows: list[dict[str, Any]] = []
+    totals = {"segments": 0, "total_records": 0, "new_records": 0, "existing_records": 0}
+    for segment in manifest["segments"]:
+        file_path = _segment_file_path(bundle_dir, segment)
+        if file_path is None:
+            raise ValueError(f"Bundle is missing data file: {segment.get('file')}")
+        preview = preview_bundle_segment(file_path, segment)
+        row = {
+            "segment_id": segment["segment_id"],
+            "symbol": segment["symbol"],
+            "exchange": segment["exchange"],
+            "interval": segment["interval"],
+            "bundle_first": segment["first_timestamp"],
+            "bundle_last": segment["last_timestamp"],
+            "bundle_records": segment["record_count"],
+            **preview,
+        }
+        rows.append(row)
+        totals["segments"] += 1
+        totals["total_records"] += preview["total"]
+        totals["new_records"] += preview["new"]
+        totals["existing_records"] += preview["existing"]
+    return {"segments": rows, "totals": totals}
+
+
+def save_migration_bundle(file_storage) -> tuple[bool, dict[str, Any], int]:
+    """
+    Stage an uploaded .hbpkg and return its restore preview.
+
+    The bundle is extracted into a server-controlled staging directory keyed by
+    a generated id; the original filename never touches the filesystem. The
+    database itself is not modified until the caller confirms the restore.
+    """
+    import shutil
+    import uuid
+
+    from database import historify_db
+
+    bundle_id = None
+    staging_committed = False
+    try:
+        filename = os.path.basename(file_storage.filename or "")
+        if not filename.lower().endswith(historify_db.BUNDLE_FILE_EXT):
+            return (
+                False,
+                {"status": "error", "message": "Migration bundles must be .hbpkg files"},
+                400,
+            )
+
+        file_storage.seek(0, 2)
+        size = file_storage.tell()
+        file_storage.seek(0)
+        if size <= 0:
+            return False, {"status": "error", "message": "Uploaded bundle is empty"}, 400
+        if size > _bundle_max_upload_bytes():
+            limit_mb = _bundle_max_upload_bytes() // (1024 * 1024)
+            return (
+                False,
+                {
+                    "status": "error",
+                    "message": f"Bundle too large. Maximum size is {limit_mb} MB",
+                },
+                400,
+            )
+
+        bundle_id = uuid.uuid4().hex
+        bundle_dir = historify_db.get_bundle_dir(bundle_id)
+        os.makedirs(bundle_dir, exist_ok=False)
+        zip_path = os.path.join(bundle_dir, "bundle.hbpkg")
+        file_storage.save(zip_path)
+
+        import zipfile
+
+        if not zipfile.is_zipfile(zip_path):
+            raise ValueError("Uploaded file is not a valid bundle archive")
+
+        _safe_extract_bundle(zip_path, bundle_dir)
+        manifest = historify_db.load_bundle_manifest(bundle_id)
+        if manifest is None:
+            raise ValueError("Bundle manifest is missing or invalid")
+        _validate_manifest_segments(manifest)
+        preview = _build_bundle_preview(bundle_id, manifest)
+
+        logger.info(
+            f"Staged migration bundle {bundle_id}: "
+            f"{preview['totals']['new_records']} new records across "
+            f"{preview['totals']['segments']} segment(s)"
+        )
+        staging_committed = True
+        return (
+            True,
+            {
+                "status": "success",
+                "bundle_id": bundle_id,
+                "created_at": manifest.get("created_at"),
+                "source": manifest.get("source"),
+                "preview": preview,
+            },
+            200,
+        )
+
+    except ValueError as exc:
+        logger.warning(f"Rejected migration bundle upload: {exc}")
+        return False, {"status": "error", "message": str(exc)}, 400
+    except Exception as e:
+        logger.exception(f"Error staging migration bundle: {e}")
+        return False, {"status": "error", "message": str(e)}, 500
+    finally:
+        # A rejected or failed upload leaves nothing behind. Accepted uploads
+        # stay staged until their restore job is deleted (or boot cleanup).
+        if not staging_committed and bundle_id:
+            failed_dir = historify_db.get_bundle_dir(bundle_id)
+            if failed_dir and os.path.isdir(failed_dir):
+                shutil.rmtree(failed_dir, ignore_errors=True)
+
+
+def start_bundle_restore(
+    bundle_id: str, segment_ids: list[str] | None = None
+) -> tuple[bool, dict[str, Any], int]:
+    """
+    Create and start a resumable bundle_restore job for a staged bundle.
+    """
+    import json
+    import uuid
+
+    from database import historify_db
+
+    try:
+        manifest = historify_db.load_bundle_manifest(bundle_id)
+        bundle_dir = historify_db.get_bundle_dir(bundle_id)
+        if manifest is None or bundle_dir is None:
+            return False, {"status": "error", "message": "Bundle not found"}, 404
+        _validate_manifest_segments(manifest)
+
+        segments = manifest["segments"]
+        if segment_ids:
+            chosen = set(segment_ids)
+            segments = [s for s in segments if s["segment_id"] in chosen]
+            if not segments:
+                return (
+                    False,
+                    {"status": "error", "message": "No valid segments selected"},
+                    400,
+                )
+
+        # Every referenced file must be present in staging.
+        for segment in segments:
+            if historify_db._segment_file_path(bundle_dir, segment) is None:
+                return (
+                    False,
+                    {
+                        "status": "error",
+                        "message": f"Bundle is missing data for {segment['symbol']} "
+                        f"({segment['interval']})",
+                    },
+                    400,
+                )
+
+        # One active restore per bundle: two concurrent restores are made safe
+        # by ON CONFLICT DO NOTHING, but they would do the same work twice. A
+        # live claim in _running_jobs distinguishes a queued/running/paused
+        # processor from a stale 'pending' row left by a crashed process.
+        with _job_state_lock:
+            claimed_jobs = set(_running_jobs)
+        # The list endpoint omits config, so fetch each live candidate in full.
+        for listed in historify_db.get_all_download_jobs(limit=200):
+            if listed.get("job_type") != BUNDLE_RESTORE_JOB_TYPE:
+                continue
+            if listed.get("status") not in ("pending", "running", "paused"):
+                continue
+            if listed.get("id") not in claimed_jobs:
+                continue
+            candidate = historify_db.get_download_job(listed["id"]) or {}
+            try:
+                existing_config = json.loads(candidate.get("config") or "{}")
+            except (TypeError, ValueError):
+                existing_config = {}
+            if existing_config.get("bundle_id") == bundle_id:
+                return (
+                    False,
+                    {
+                        "status": "error",
+                        "message": "A restore for this bundle is already in progress",
+                        "job_id": listed.get("id"),
+                    },
+                    409,
+                )
+
+        job_id = str(uuid.uuid4())[:8]
+        min_ts = min(s["first_timestamp"] for s in segments)
+        max_ts = max(s["last_timestamp"] for s in segments)
+        config = {
+            "bundle_id": bundle_id,
+            "bundle_created_at": manifest.get("created_at"),
+            "source": manifest.get("source"),
+        }
+        items = [
+            {"symbol": s["symbol"], "exchange": s["exchange"], "interval": s["interval"]}
+            for s in segments
+        ]
+
+        success, msg = historify_db.create_download_job(
+            job_id=job_id,
+            job_type=BUNDLE_RESTORE_JOB_TYPE,
+            symbols=[],
+            interval="bundle",
+            start_date=datetime.fromtimestamp(min_ts).strftime("%Y-%m-%d"),
+            end_date=datetime.fromtimestamp(max_ts).strftime("%Y-%m-%d"),
+            config=config,
+            items=items,
+        )
+        if not success:
+            return False, {"status": "error", "message": msg}, 500
+
+        with _job_state_lock:
+            _running_jobs[job_id] = True
+            _paused_jobs[job_id] = threading.Event()
+            _paused_jobs[job_id].set()
+
+        try:
+            _job_executor.submit(_process_bundle_restore_job, job_id)
+        except Exception:
+            _cleanup_job(job_id)
+            historify_db.update_job_status(job_id, "failed", "Could not start bundle restore")
+            raise
+
+        return (
+            True,
+            {
+                "status": "success",
+                "message": f"Restore started for {len(segments)} segment(s)",
+                "job_id": job_id,
+                "total_segments": len(segments),
+            },
+            200,
+        )
+
+    except Exception as e:
+        logger.exception(f"Error starting bundle restore: {e}")
+        return False, {"status": "error", "message": str(e)}, 500
+
+
+def _process_bundle_restore_job(job_id: str):
+    """
+    Background processor for a bundle_restore job.
+
+    Same control plane as ``_process_download_job`` (cancellation, pause drain,
+    completion events, checkpoint resume) but the work units are manifest
+    segments restored through ``import_bundle_segment``. Items already marked
+    success are skipped; pending/restoring/error items are (re)processed, so
+    both an interruption and an explicit retry resume where work remains.
+    """
+    import json
+
+    from database import historify_db
+
+    config = {}
+    completed = failed = total_items = inserted_total = 0
+    final_status = "failed"
+    try:
+        job = historify_db.get_download_job(job_id)
+        if not job:
+            logger.error(f"Bundle restore job {job_id} not found")
+            _cleanup_job(job_id)
+            return
+
+        try:
+            config = json.loads(job.get("config") or "{}")
+        except (TypeError, ValueError):
+            config = {}
+        bundle_id = config.get("bundle_id")
+        manifest = historify_db.load_bundle_manifest(bundle_id) if bundle_id else None
+        bundle_dir = historify_db.get_bundle_dir(bundle_id) if bundle_id else None
+        if manifest is None or bundle_dir is None:
+            historify_db.update_job_status(
+                job_id, "failed", "Bundle files are no longer available"
+            )
+            _cleanup_job(job_id)
+            return
+
+        segment_by_key = {
+            (s["symbol"], s["exchange"], s["interval"]): s for s in manifest["segments"]
+        }
+
+        historify_db.update_job_status(job_id, "running")
+        items = historify_db.get_job_items(job_id)
+        if not items:
+            historify_db.update_job_status(job_id, "failed", "No segments to restore")
+            _cleanup_job(job_id)
+            return
+
+        active_items = [
+            item
+            for item in items
+            if item["status"] in ("pending", "restoring", "error")
+        ]
+        already_completed = sum(1 for item in items if item["status"] == "success")
+        already_failed = sum(1 for item in items if item["status"] == "error")
+        completed = already_completed
+        failed = already_failed
+        total_items = len(items)
+        processed_count = already_completed + already_failed
+
+        for item in active_items:
+            with _job_state_lock:
+                is_cancelled = not _running_jobs.get(job_id, False)
+                pause_event = _paused_jobs.get(job_id)
+
+            if is_cancelled:
+                logger.info(f"Bundle restore {job_id} cancelled")
+                historify_db.update_job_status(job_id, "cancelled")
+                final_status = "cancelled"
+                _cleanup_job(job_id)
+                return
+
+            if pause_event:
+                while not pause_event.is_set():
+                    _emit_job_paused(job_id, processed_count, total_items)
+                    pause_event.wait(timeout=1.0)
+                    with _job_state_lock:
+                        is_cancelled = not _running_jobs.get(job_id, False)
+                    if is_cancelled:
+                        historify_db.update_job_status(job_id, "cancelled")
+                        final_status = "cancelled"
+                        _cleanup_job(job_id)
+                        return
+
+            interval = item.get("interval")
+            key = (item["symbol"], item["exchange"], interval)
+            segment = segment_by_key.get(key)
+            processed_count += 1
+            label = f"{item['symbol']}:{item['exchange']} {interval}"
+            _emit_progress(job_id, processed_count, total_items, label)
+            historify_db.update_job_item_status(item["id"], BUNDLE_ITEM_ACTIVE_STATUS)
+
+            try:
+                if segment is None:
+                    raise ValueError(
+                        f"Bundle manifest has no segment for {label}"
+                    )
+                file_path = historify_db._segment_file_path(bundle_dir, segment)
+                if file_path is None:
+                    raise ValueError(f"Bundle data file missing for {label}")
+
+                actual_sha = _sha256_file(file_path)
+                if actual_sha != segment.get("sha256"):
+                    raise ValueError(
+                        f"Checksum mismatch for {label}; the bundle file is corrupt"
+                    )
+
+                result = historify_db.import_bundle_segment(file_path, segment)
+                inserted_total += result["inserted"]
+                historify_db.update_job_item_status(
+                    item["id"], "success", result["inserted"]
+                )
+                completed += 1
+            except Exception as e:
+                logger.exception(f"Bundle restore failed for {label}: {e}")
+                historify_db.update_job_item_status(item["id"], "error", 0, str(e))
+                failed += 1
+
+            historify_db.update_job_progress(job_id, completed, failed)
+
+        # Honour a pause landing between the final item and the terminal write.
+        while True:
+            with _job_state_lock:
+                pending_write = _job_status_writes.get(job_id)
+                final_pause_event = _paused_jobs.get(job_id)
+                cancelled_at_finish = not _running_jobs.get(job_id, False)
+                if not pending_write and (
+                    cancelled_at_finish
+                    or not final_pause_event
+                    or final_pause_event.is_set()
+                ):
+                    if not cancelled_at_finish:
+                        _running_jobs.pop(job_id, None)
+                        _paused_jobs.pop(job_id, None)
+                    break
+            if pending_write:
+                pending_write.wait(timeout=1.0)
+            elif final_pause_event:
+                _emit_job_paused(job_id, processed_count, total_items)
+                final_pause_event.wait(timeout=1.0)
+
+        final_status = (
+            "cancelled"
+            if cancelled_at_finish
+            else ("completed" if failed == 0 else "completed_with_errors")
+        )
+        historify_db.update_job_status(job_id, final_status)
+        _emit_job_complete(job_id, completed, failed, total_items)
+        logger.info(
+            f"Bundle restore {job_id} finished: {completed} ok, {failed} failed, "
+            f"{inserted_total} rows added"
+        )
+        _cleanup_job(job_id)
+
+    except Exception as e:
+        logger.exception(f"Error processing bundle restore {job_id}: {e}")
+        historify_db.update_job_status(job_id, "failed", str(e))
+        _cleanup_job(job_id)
+    finally:
+        from utils.db_sessions import remove_all_scoped_sessions
+
+        remove_all_scoped_sessions()
+
+
+def _retry_bundle_restore(job_id: str) -> tuple[bool, dict[str, Any], int]:
+    """Restart a bundle restore, reprocessing its failed segments."""
+    import json
+
+    from database import historify_db
+
+    try:
+        job = historify_db.get_download_job(job_id)
+        if not job:
+            return False, {"status": "error", "message": "Job not found"}, 404
+        if job["status"] == "running":
+            return False, {"status": "error", "message": "Job is already running"}, 400
+
+        bundle_id = None
+        try:
+            bundle_id = (json.loads(job.get("config") or "{}")).get("bundle_id")
+        except (TypeError, ValueError):
+            bundle_id = None
+        if not bundle_id or not historify_db.load_bundle_manifest(bundle_id):
+            return (
+                False,
+                {"status": "error", "message": "Bundle files are no longer available"},
+                400,
+            )
+
+        failed_items = historify_db.get_job_items(job_id, status="error")
+        with _job_state_lock:
+            if job_id in _running_jobs:
+                return False, {"status": "error", "message": RETRY_BUSY_MESSAGE}, 409
+            _running_jobs[job_id] = True
+            _paused_jobs[job_id] = threading.Event()
+            _paused_jobs[job_id].set()
+
+        try:
+            for item in failed_items:
+                historify_db.update_job_item_status(item["id"], "pending")
+            historify_db.update_job_status(job_id, "pending")
+            _job_executor.submit(_process_bundle_restore_job, job_id)
+        except Exception:
+            _cleanup_job(job_id)
+            raise
+
+        return (
+            True,
+            {
+                "status": "success",
+                "message": f"Retrying {len(failed_items)} failed segment(s)",
+                "retry_count": len(failed_items),
+            },
+            200,
+        )
+    except Exception as e:
+        logger.exception(f"Error retrying bundle restore: {e}")
+        return False, {"status": "error", "message": str(e)}, 500
+
+
+def _remove_bundle_staging_if_orphaned(bundle_id: str) -> None:
+    """Drop a restored bundle's files once no job references them any more."""
+    import shutil
+
+    from database import historify_db
+
+    if not bundle_id or bundle_id in historify_db.get_bundle_ids_referenced_by_jobs():
+        return
+    bundle_dir = historify_db.get_bundle_dir(bundle_id)
+    if bundle_dir and os.path.isdir(bundle_dir):
+        shutil.rmtree(bundle_dir, ignore_errors=True)
+        logger.info(f"Removed staging for deleted bundle restore: {bundle_id}")
 
 
 # =============================================================================
@@ -2350,3 +2993,12 @@ try:
     cleanup_zombie_jobs()
 except Exception as e:
     logger.exception(f"Failed to cleanup zombie jobs on startup: {e}")
+
+# Drop bundle staging directories no restore job references (interrupted
+# uploads from a previous process, or jobs deleted by an older version).
+try:
+    from database.historify_db import cleanup_orphan_bundle_staging
+
+    cleanup_orphan_bundle_staging()
+except Exception as e:
+    logger.exception(f"Failed to clean orphaned migration bundles on startup: {e}")

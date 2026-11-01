@@ -9,7 +9,7 @@ Optimized for backtesting and analytical queries.
 import os
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -291,13 +291,16 @@ def init_database():
             )
         """)
 
-        # Job Items Table - individual symbol status within a job
+        # Job Items Table - individual symbol status within a job.
+        # ``interval`` is set for bundle_restore jobs, whose work unit is one
+        # (symbol, exchange, interval) segment; download jobs leave it NULL.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS job_items (
                 id INTEGER PRIMARY KEY,
                 job_id VARCHAR NOT NULL,
                 symbol VARCHAR NOT NULL,
                 exchange VARCHAR NOT NULL,
+                interval VARCHAR,
                 status VARCHAR NOT NULL,
                 records_downloaded INTEGER DEFAULT 0,
                 error_message VARCHAR,
@@ -305,6 +308,16 @@ def init_database():
                 completed_at TIMESTAMP
             )
         """)
+
+        # Existing databases predate the interval column; add it in place.
+        # upgrade/migrate_historify_bundle.py applies the same step offline.
+        job_item_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info('job_items')").fetchall()
+        }
+        if "interval" not in job_item_columns:
+            conn.execute("ALTER TABLE job_items ADD COLUMN interval VARCHAR")
+            logger.info("Added interval column to job_items")
 
         # Symbol Metadata Table - enriched symbol info for display
         conn.execute("""
@@ -1881,18 +1894,24 @@ def create_download_job(
     start_date: str,
     end_date: str,
     config: dict[str, Any] = None,
+    items: list[dict[str, Any]] | None = None,
 ) -> tuple[bool, str]:
     """
     Create a new download job with symbol items.
 
     Args:
         job_id: Unique job identifier
-        job_type: Type of job ('watchlist', 'option_chain', 'futures_chain', 'custom')
+        job_type: Type of job ('watchlist', 'option_chain', 'futures_chain',
+            'custom', 'bundle_restore')
         symbols: List of dicts with 'symbol' and 'exchange' keys
         interval: Time interval for download
         start_date: Start date (YYYY-MM-DD)
         end_date: End date (YYYY-MM-DD)
         config: Optional configuration dict (JSON serializable)
+        items: Explicit job items, each with 'symbol', 'exchange' and an
+            optional 'interval'. Used by bundle_restore jobs, whose work unit
+            is one (symbol, exchange, interval) segment. Falls back to one
+            item per ``symbols`` (interval NULL) when omitted.
 
     Returns:
         Tuple of (success, message)
@@ -1900,6 +1919,29 @@ def create_download_job(
     import json
 
     try:
+        if items is not None:
+            item_rows = [
+                {
+                    "job_id": job_id,
+                    "symbol": item["symbol"].upper(),
+                    "exchange": item["exchange"].upper(),
+                    "interval": item.get("interval"),
+                    "status": "pending",
+                }
+                for item in items
+            ]
+        else:
+            item_rows = [
+                {
+                    "job_id": job_id,
+                    "symbol": sym["symbol"].upper(),
+                    "exchange": sym["exchange"].upper(),
+                    "interval": None,
+                    "status": "pending",
+                }
+                for sym in symbols
+            ]
+
         with get_connection() as conn:
             # Begin a transaction for atomicity
             conn.execute("BEGIN TRANSACTION")
@@ -1915,7 +1957,7 @@ def create_download_job(
                     [
                         job_id,
                         job_type,
-                        len(symbols),
+                        len(item_rows),
                         interval,
                         start_date,
                         end_date,
@@ -1923,29 +1965,19 @@ def create_download_job(
                     ],
                 )
 
-                # Prepare symbols DataFrame for batch insert
+                # Prepare items DataFrame for batch insert
                 # Use atomic ID generation within the same transaction
-                if symbols:
-                    symbols_df = pd.DataFrame(
-                        [
-                            {
-                                "job_id": job_id,
-                                "symbol": sym["symbol"].upper(),
-                                "exchange": sym["exchange"].upper(),
-                                "status": "pending",
-                            }
-                            for sym in symbols
-                        ]
-                    )
+                if item_rows:
+                    items_df = pd.DataFrame(item_rows)
 
                     # Sequence allocation is atomic and independent of other
                     # jobs, unlike MAX(id) + ROW_NUMBER().
                     conn.execute("""
-                        INSERT INTO job_items (id, job_id, symbol, exchange, status)
+                        INSERT INTO job_items (id, job_id, symbol, exchange, interval, status)
                         SELECT
                             nextval('job_items_id_seq') as id,
-                            job_id, symbol, exchange, status
-                        FROM symbols_df
+                            job_id, symbol, exchange, interval, status
+                        FROM items_df
                     """)
 
                 conn.execute("COMMIT")
@@ -1954,8 +1986,8 @@ def create_download_job(
                 conn.execute("ROLLBACK")
                 raise inner_e
 
-        logger.info(f"Created download job {job_id} with {len(symbols)} symbols")
-        return True, f"Job created with {len(symbols)} symbols"
+        logger.info(f"Created download job {job_id} with {len(item_rows)} items")
+        return True, f"Job created with {len(item_rows)} items"
 
     except Exception as e:
         logger.exception(f"Error creating download job: {e}")
@@ -2070,7 +2102,7 @@ def get_job_items(job_id: str, status: str = None) -> list[dict[str, Any]]:
             if status:
                 result = conn.execute(
                     """
-                    SELECT id, job_id, symbol, exchange, status,
+                    SELECT id, job_id, symbol, exchange, interval, status,
                            records_downloaded, error_message, started_at, completed_at
                     FROM job_items
                     WHERE job_id = ? AND status = ?
@@ -2081,7 +2113,7 @@ def get_job_items(job_id: str, status: str = None) -> list[dict[str, Any]]:
             else:
                 result = conn.execute(
                     """
-                    SELECT id, job_id, symbol, exchange, status,
+                    SELECT id, job_id, symbol, exchange, interval, status,
                            records_downloaded, error_message, started_at, completed_at
                     FROM job_items
                     WHERE job_id = ?
@@ -2099,6 +2131,12 @@ def get_job_items(job_id: str, status: str = None) -> list[dict[str, Any]]:
                     result[col] = result[col].apply(
                         lambda x: x.isoformat() if pd.notna(x) else None
                     )
+            # NULL interval arrives as NaN in the object column; normalize to
+            # None so callers see a missing interval rather than a float.
+            if "interval" in result.columns:
+                result["interval"] = result["interval"].where(
+                    result["interval"].notna(), None
+                )
 
             return result.to_dict("records")
 
@@ -2155,7 +2193,7 @@ def update_job_item_status(
     """Update the status of a job item."""
     try:
         with get_connection() as conn:
-            if status == "downloading":
+            if status in ("downloading", "restoring"):
                 conn.execute(
                     """
                     UPDATE job_items
@@ -3200,6 +3238,521 @@ def get_export_preview(
             "estimated_size_parquet_mb": 0,
             "error": str(e),
         }
+
+
+# =============================================================================
+# Migration Bundle Operations (machine-to-machine data transfer)
+# =============================================================================
+#
+# A migration bundle is a ZIP archive (``.hbpkg``) produced on one machine and
+# restored on another. Unlike the human-readable CSV/ZIP exporters it carries
+# raw stored candles (one ZSTD Parquet file per symbol/exchange/interval
+# segment) plus a manifest with per-segment ranges, counts and SHA-256 hashes.
+# The manifest is what lets the target preview what is new before touching its
+# database and resume an interrupted restore segment by segment.
+
+BUNDLE_FORMAT = "historify-bundle"
+BUNDLE_VERSION = 1
+BUNDLE_FILE_EXT = ".hbpkg"
+BUNDLE_MANIFEST_NAME = "manifest.json"
+BUNDLE_DATA_PREFIX = "data/"
+# Only physically stored intervals travel in a bundle; computed timeframes
+# (5m/15m/1h/W/M/...) are re-derived on the target from the 1m/D rows.
+BUNDLE_INTERVALS = ("1m", "D")
+
+
+def _sql_quote_literal(value: str) -> str:
+    """Quote a string for safe embedding as a DuckDB SQL string literal.
+
+    File paths handed to ``COPY ... TO`` and ``read_parquet()`` cannot use
+    bound parameters (DuckDB substitutes them inconsistently), and the paths
+    here are always server-generated; doubling embedded quotes removes the
+    last injection surface.
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def get_bundles_dir() -> str:
+    """Directory holding extracted, not-yet-restored migration bundles."""
+    ensure_db_directory()
+    return os.path.join(os.path.dirname(get_db_path()), "historify_bundles")
+
+
+def _is_safe_bundle_id(bundle_id: str) -> bool:
+    """A bundle id is a hex/hyphen token; anything else is rejected outright."""
+    import re
+
+    return bool(re.fullmatch(r"[0-9a-fA-F-]{8,64}", bundle_id or ""))
+
+
+def get_bundle_dir(bundle_id: str) -> str | None:
+    """Absolute staging directory for a bundle id, or None if the id is unsafe."""
+    if not _is_safe_bundle_id(bundle_id):
+        return None
+    return os.path.join(get_bundles_dir(), bundle_id)
+
+
+def load_bundle_manifest(bundle_id: str) -> dict[str, Any] | None:
+    """Load and minimally validate a staged bundle manifest."""
+    import json
+
+    bundle_dir = get_bundle_dir(bundle_id)
+    if not bundle_dir:
+        return None
+    manifest_path = os.path.join(bundle_dir, BUNDLE_MANIFEST_NAME)
+    if not os.path.isfile(manifest_path):
+        return None
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    if manifest.get("format") != BUNDLE_FORMAT or not isinstance(
+        manifest.get("segments"), list
+    ):
+        return None
+    return manifest
+
+
+def build_migration_bundle(
+    output_path: str,
+    symbols: list[dict[str, str]] | None = None,
+    intervals: list[str] | None = None,
+    start_timestamp: int | None = None,
+    end_timestamp: int | None = None,
+) -> tuple[bool, str, dict[str, Any]]:
+    """
+    Package stored candles for the selected symbols/intervals/date range.
+
+    The archive layout is::
+
+        manifest.json
+        data/0001_<SYMBOL>_<EXCHANGE>_<interval>.parquet
+        ...
+
+    Each segment holds raw ``market_data`` rows (timestamp, OHLCV, oi) with
+    ZSTD compression. The manifest records the range, count and SHA-256 of
+    every segment so the target can preview, verify and resume restores.
+
+    Returns:
+        (success, message, summary) where summary carries ``segments``,
+        ``total_records``, ``symbol_count`` and ``file_size_bytes``.
+    """
+    import hashlib
+    import json
+    import shutil
+    import socket
+    import tempfile
+    import zipfile
+
+    build_dir = None
+    abs_output = os.path.realpath(os.path.abspath(output_path))
+    try:
+        # Output must live under the temp directory, like every other exporter.
+        if not abs_output.startswith(os.path.realpath(tempfile.gettempdir())):
+            return False, "Invalid output path: must be within temp directory", {}
+
+        chosen_intervals = list(intervals) if intervals else list(BUNDLE_INTERVALS)
+        invalid = [i for i in chosen_intervals if i not in BUNDLE_INTERVALS]
+        if invalid:
+            return False, f"Only stored intervals can be bundled: {invalid}", {}
+        # De-duplicate while keeping a stable order.
+        chosen_intervals = [i for i in BUNDLE_INTERVALS if i in set(chosen_intervals)]
+        if not chosen_intervals:
+            return False, "No intervals selected", {}
+
+        build_dir = tempfile.mkdtemp(prefix="historify_bundle_", dir=tempfile.gettempdir())
+        os.makedirs(os.path.dirname(abs_output), exist_ok=True)
+
+        manifest_segments: list[dict[str, Any]] = []
+        total_records = 0
+        segment_index = 0
+
+        with get_connection() as conn:
+            if symbols:
+                symbols_list = [
+                    (s["symbol"].upper(), s["exchange"].upper()) for s in symbols
+                ]
+            else:
+                rows = conn.execute("""
+                    SELECT DISTINCT symbol, exchange FROM data_catalog
+                    ORDER BY symbol, exchange
+                """).fetchall()
+                symbols_list = [(r[0], r[1]) for r in rows]
+
+            if not symbols_list:
+                return False, "No symbols found to bundle", {}
+
+            for sym, exch in symbols_list:
+                for interval in chosen_intervals:
+                    params: list[Any] = [sym, exch, interval]
+                    where = "symbol = ? AND exchange = ? AND interval = ?"
+                    if start_timestamp:
+                        where += " AND timestamp >= ?"
+                        params.append(start_timestamp)
+                    if end_timestamp:
+                        where += " AND timestamp <= ?"
+                        params.append(end_timestamp)
+
+                    summary_row = conn.execute(
+                        f"""
+                        SELECT COUNT(*), COALESCE(MIN(timestamp), 0),
+                               COALESCE(MAX(timestamp), 0)
+                        FROM market_data WHERE {where}
+                        """,
+                        params,
+                    ).fetchone()
+                    record_count, first_ts, last_ts = summary_row
+                    if not record_count:
+                        continue
+
+                    segment_index += 1
+                    segment_id = f"{segment_index:04d}"
+                    file_name = (
+                        f"{segment_id}_{_sanitize_filename(sym)}_"
+                        f"{_sanitize_filename(exch)}_{_sanitize_filename(interval)}.parquet"
+                    )
+                    parquet_path = os.path.join(build_dir, file_name)
+                    parquet_literal = _sql_quote_literal(parquet_path)
+                    conn.execute(
+                        f"""
+                        COPY (
+                            SELECT timestamp, open, high, low, close, volume, oi
+                            FROM market_data
+                            WHERE {where}
+                            ORDER BY timestamp
+                        ) TO {parquet_literal}
+                        (FORMAT PARQUET, COMPRESSION ZSTD)
+                        """,
+                        params,
+                    )
+
+                    sha256_hash = hashlib.sha256()
+                    with open(parquet_path, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                            sha256_hash.update(chunk)
+
+                    manifest_segments.append(
+                        {
+                            "segment_id": segment_id,
+                            "symbol": sym,
+                            "exchange": exch,
+                            "interval": interval,
+                            "first_timestamp": int(first_ts),
+                            "last_timestamp": int(last_ts),
+                            "record_count": int(record_count),
+                            "file": f"{BUNDLE_DATA_PREFIX}{file_name}",
+                            "sha256": sha256_hash.hexdigest(),
+                        }
+                    )
+                    total_records += int(record_count)
+
+        if not manifest_segments:
+            return False, "No data matching the criteria", {}
+
+        manifest = {
+            "format": BUNDLE_FORMAT,
+            "version": BUNDLE_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source": {"hostname": socket.gethostname()},
+            "segments": manifest_segments,
+        }
+
+        # Parquet is already ZSTD-compressed, so store without deflating again;
+        # this also makes streaming extraction of a large 1m bundle cheap.
+        with zipfile.ZipFile(abs_output, "w", zipfile.ZIP_STORED) as zf:
+            zf.writestr(
+                BUNDLE_MANIFEST_NAME,
+                json.dumps(manifest, indent=2, sort_keys=True),
+            )
+            for segment in manifest_segments:
+                zf.write(
+                    os.path.join(build_dir, os.path.basename(segment["file"])),
+                    arcname=segment["file"],
+                )
+
+        file_size = os.path.getsize(abs_output)
+        summary = {
+            "segments": len(manifest_segments),
+            "total_records": total_records,
+            "symbol_count": len({(s["symbol"], s["exchange"]) for s in manifest_segments}),
+            "file_size_bytes": file_size,
+            "filename": os.path.basename(abs_output),
+        }
+        message = (
+            f"Bundle ready: {summary['segments']} segment(s), "
+            f"{total_records} records, {file_size / (1024 * 1024):.2f} MB"
+        )
+        logger.info(message)
+        return True, message, summary
+
+    except Exception as e:
+        logger.exception(f"Error building migration bundle: {e}")
+        if os.path.exists(abs_output):
+            try:
+                os.remove(abs_output)
+            except OSError:
+                pass
+        return False, str(e), {}
+    finally:
+        if build_dir and os.path.isdir(build_dir):
+            shutil.rmtree(build_dir, ignore_errors=True)
+
+
+def _segment_file_path(bundle_dir: str, segment: dict[str, Any]) -> str | None:
+    """Resolve a manifest entry to its extracted file, rejecting traversal."""
+    rel_name = segment.get("file", "")
+    if not rel_name.startswith(BUNDLE_DATA_PREFIX) or rel_name.endswith("/"):
+        return None
+    # Normalise and keep the path strictly inside the staging directory.
+    candidate = os.path.realpath(os.path.join(bundle_dir, rel_name))
+    if not candidate.startswith(os.path.realpath(bundle_dir) + os.sep):
+        return None
+    if not os.path.isfile(candidate):
+        return None
+    return candidate
+
+
+def get_local_segment_coverage(
+    symbol: str, exchange: str, interval: str
+) -> dict[str, int | None]:
+    """Local coverage for one key: first/last timestamp and total row count."""
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(MIN(timestamp), 0), COALESCE(MAX(timestamp), 0), COUNT(*)
+                FROM market_data
+                WHERE symbol = ? AND exchange = ? AND interval = ?
+                """,
+                [symbol.upper(), exchange.upper(), interval],
+            ).fetchone()
+        if not row or not row[2]:
+            return {"local_first": None, "local_last": None, "local_count": 0}
+        return {
+            "local_first": int(row[0]),
+            "local_last": int(row[1]),
+            "local_count": int(row[2]),
+        }
+    except Exception as e:
+        logger.exception(f"Error reading local coverage: {e}")
+        return {"local_first": None, "local_last": None, "local_count": 0}
+
+
+def preview_bundle_segment(file_path: str, segment: dict[str, Any]) -> dict[str, Any]:
+    """
+    Compare one extracted segment against local rows.
+
+    Returns the segment's bundle totals plus ``existing`` (rows the local
+    database already holds by primary key) and ``new`` (rows a restore would
+    add). The comparison is keyed on (symbol, exchange, interval, timestamp),
+    which is exactly the conflict target the restore uses, so preview and
+    restore can never disagree.
+    """
+    symbol = segment["symbol"].upper()
+    exchange = segment["exchange"].upper()
+    interval = segment["interval"]
+    parquet_literal = _sql_quote_literal(file_path)
+
+    with get_connection() as conn:
+        total, existing = conn.execute(
+            f"""
+            SELECT COUNT(*), COUNT(m.timestamp)
+            FROM read_parquet({parquet_literal}) b
+            LEFT JOIN market_data m
+              ON m.symbol = ?
+             AND m.exchange = ?
+             AND m.interval = ?
+             AND m.timestamp = b.timestamp
+            """,
+            [symbol, exchange, interval],
+        ).fetchone()
+
+    coverage = get_local_segment_coverage(symbol, exchange, interval)
+    total = int(total)
+    existing = int(existing)
+    new = total - existing
+    if new == total:
+        state = "new"
+    elif new == 0:
+        state = "existing"
+    else:
+        state = "partial"
+    return {
+        "total": total,
+        "existing": existing,
+        "new": new,
+        "state": state,
+        **coverage,
+    }
+
+
+@_serialized_write
+@_retry_duckdb_conflict
+def import_bundle_segment(file_path: str, segment: dict[str, Any]) -> dict[str, int]:
+    """
+    Restore one segment into ``market_data`` without duplicating any row.
+
+    Rows whose primary key already exists are left untouched (``DO NOTHING``),
+    so importing a bundle twice — or re-running an interrupted restore — never
+    creates duplicates and never overwrites candles the target already holds.
+    The catalog entry is recomputed from the actual rows in the same
+    transaction, so it cannot advertise a range that the data does not cover.
+
+    Returns:
+        {"total": rows offered by the segment, "inserted": rows newly added}
+    """
+    symbol = segment["symbol"].upper()
+    exchange = segment["exchange"].upper()
+    interval = segment["interval"]
+    parquet_literal = _sql_quote_literal(file_path)
+
+    with get_connection() as conn:
+        # DESCRIBE's first column is the column name (PRAGMA table_info uses 1).
+        columns = {
+            row[0]
+            for row in conn.execute(
+                f"DESCRIBE SELECT * FROM read_parquet({parquet_literal})"
+            ).fetchall()
+        }
+        required = {"timestamp", "open", "high", "low", "close", "volume"}
+        missing = required - columns
+        if missing:
+            raise ValueError(
+                f"Segment {symbol}:{exchange}:{interval} is missing columns: "
+                f"{sorted(missing)}"
+            )
+        oi_expr = "COALESCE(oi, 0)" if "oi" in columns else "0"
+
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            count_row = conn.execute(
+                f"""
+                SELECT COUNT(*), SUM(CASE WHEN m.timestamp IS NULL THEN 1 ELSE 0 END)
+                FROM read_parquet({parquet_literal}) b
+                LEFT JOIN market_data m
+                  ON m.symbol = ?
+                 AND m.exchange = ?
+                 AND m.interval = ?
+                 AND m.timestamp = b.timestamp
+                """,
+                [symbol, exchange, interval],
+            ).fetchone()
+            total = int(count_row[0])
+            inserted = int(count_row[1] or 0)
+
+            conn.execute(
+                f"""
+                INSERT INTO market_data
+                    (symbol, exchange, interval, timestamp,
+                     open, high, low, close, volume, oi)
+                SELECT ?, ?, ?,
+                       CAST(b.timestamp AS BIGINT),
+                       CAST(b.open AS DOUBLE), CAST(b.high AS DOUBLE),
+                       CAST(b.low AS DOUBLE), CAST(b.close AS DOUBLE),
+                       CAST(b.volume AS BIGINT), CAST({oi_expr} AS BIGINT)
+                FROM read_parquet({parquet_literal}) b
+                ON CONFLICT (symbol, exchange, interval, timestamp) DO NOTHING
+                """,
+                [symbol, exchange, interval],
+            )
+
+            # Refresh the catalog from the actual rows in the same transaction.
+            catalog_exists = conn.execute(
+                """
+                SELECT id FROM data_catalog
+                WHERE symbol = ? AND exchange = ? AND interval = ?
+                """,
+                [symbol, exchange, interval],
+            ).fetchone()
+            if catalog_exists:
+                conn.execute(
+                    """
+                    UPDATE data_catalog SET
+                        first_timestamp = (SELECT MIN(timestamp) FROM market_data
+                                           WHERE symbol = ? AND exchange = ? AND interval = ?),
+                        last_timestamp = (SELECT MAX(timestamp) FROM market_data
+                                          WHERE symbol = ? AND exchange = ? AND interval = ?),
+                        record_count = (SELECT COUNT(*) FROM market_data
+                                        WHERE symbol = ? AND exchange = ? AND interval = ?),
+                        last_download_at = current_timestamp
+                    WHERE symbol = ? AND exchange = ? AND interval = ?
+                    """,
+                    [symbol, exchange, interval] * 3 + [symbol, exchange, interval],
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO data_catalog
+                    (id, symbol, exchange, interval, first_timestamp, last_timestamp,
+                     record_count, last_download_at)
+                    SELECT nextval('data_catalog_id_seq'), ?, ?, ?,
+                           MIN(timestamp), MAX(timestamp), COUNT(*), current_timestamp
+                    FROM market_data
+                    WHERE symbol = ? AND exchange = ? AND interval = ?
+                    """,
+                    [symbol, exchange, interval, symbol, exchange, interval],
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    logger.info(
+        f"Restored {inserted}/{total} new rows for {symbol}:{exchange}:{interval}"
+    )
+    return {"total": total, "inserted": inserted}
+
+
+def get_bundle_ids_referenced_by_jobs() -> set[str]:
+    """Bundle ids still referenced by a (possibly failed) restore job."""
+    import json
+
+    ids: set[str] = set()
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT config FROM download_jobs
+                WHERE job_type = 'bundle_restore' AND config IS NOT NULL
+                """
+            ).fetchall()
+        for (config_text,) in rows:
+            try:
+                config = json.loads(config_text)
+            except (TypeError, ValueError):
+                continue
+            bundle_id = config.get("bundle_id")
+            if bundle_id and _is_safe_bundle_id(bundle_id):
+                ids.add(bundle_id)
+    except Exception as e:
+        logger.exception(f"Error listing bundle ids from jobs: {e}")
+    return ids
+
+
+def cleanup_orphan_bundle_staging() -> int:
+    """
+    Remove staged bundles that no restore job references any more.
+
+    A bundle's staging directory is kept while its job exists so a failed or
+    interrupted restore can be retried; deleting the job drops the files.
+    Orphaned directories (server killed mid-upload, or jobs deleted by an
+    older version) are reaped at startup.
+    """
+    import shutil
+
+    bundles_dir = get_bundles_dir()
+    if not os.path.isdir(bundles_dir):
+        return 0
+
+    referenced = get_bundle_ids_referenced_by_jobs()
+    removed = 0
+    for entry in os.listdir(bundles_dir):
+        if entry in referenced:
+            continue
+        candidate = os.path.join(bundles_dir, entry)
+        if os.path.isdir(candidate):
+            shutil.rmtree(candidate, ignore_errors=True)
+            removed += 1
+            logger.info(f"Removed unreferenced migration bundle staging: {entry}")
+    return removed
 
 
 # =============================================================================
