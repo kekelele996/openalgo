@@ -38,4 +38,25 @@ describe('ExecutionLogPanel', () => {
 
     expect(screen.getByText('Failed')).toBeTruthy()
   })
+
+  it('renders preflight statuses without calling the panel an execution', () => {
+    render(
+      <ExecutionLogPanel
+        logs={[
+          {
+            time: '2026-09-23T09:20:00.000Z',
+            message: '只读预检开始：不会下单，也不会写入正式执行记录。',
+            level: 'info',
+          },
+        ]}
+        status="check-success"
+        kind="check"
+        onClose={() => {}}
+      />
+    )
+
+    expect(screen.getByText('Order Check')).toBeTruthy()
+    expect(screen.getByText('Check passed')).toBeTruthy()
+    expect(screen.queryByText('Execution Log')).toBeNull()
+  })
 })

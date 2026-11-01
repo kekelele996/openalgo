@@ -18,24 +18,43 @@ export interface LogEntry {
  * (a workflow that waits, under the gthread web server only). Its result lands
  * in the workflow's execution history, not in this panel.
  */
-export type ExecutionStatus = 'idle' | 'running' | 'started' | 'success' | 'error'
+export type ExecutionStatus =
+  | 'idle'
+  | 'running'
+  | 'started'
+  | 'success'
+  | 'error'
+  | 'checking'
+  | 'check-success'
+  | 'check-error'
 
 interface ExecutionLogPanelProps {
   logs: LogEntry[]
   status: ExecutionStatus
   onClose: () => void
+  kind?: 'execution' | 'check'
 }
 
-export function ExecutionLogPanel({ logs, status, onClose }: ExecutionLogPanelProps) {
+export function ExecutionLogPanel({
+  logs,
+  status,
+  onClose,
+  kind = 'execution',
+}: ExecutionLogPanelProps) {
+  const isCheck = kind === 'check'
+
   const getStatusIcon = () => {
     switch (status) {
       case 'running':
+      case 'checking':
         return <Clock className="h-4 w-4 animate-pulse text-amber-500" />
       case 'started':
         return <Clock className="h-4 w-4 text-amber-500" />
       case 'success':
+      case 'check-success':
         return <CheckCircle2 className="h-4 w-4 text-green-500" />
       case 'error':
+      case 'check-error':
         return <XCircle className="h-4 w-4 text-red-500" />
       default:
         return <Terminal className="h-4 w-4 text-muted-foreground" />
@@ -45,13 +64,19 @@ export function ExecutionLogPanel({ logs, status, onClose }: ExecutionLogPanelPr
   const getStatusText = () => {
     switch (status) {
       case 'running':
-        return 'Executing...'
+        return isCheck ? 'Checking...' : 'Executing...'
+      case 'checking':
+        return 'Checking...'
       case 'started':
         return 'Running in background'
       case 'success':
-        return 'Completed'
+        return isCheck ? 'Check passed' : 'Completed'
+      case 'check-success':
+        return 'Check passed'
       case 'error':
-        return 'Failed'
+        return isCheck ? 'Check failed' : 'Failed'
+      case 'check-error':
+        return 'Check failed'
       default:
         return 'Ready'
     }
@@ -88,15 +113,17 @@ export function ExecutionLogPanel({ logs, status, onClose }: ExecutionLogPanelPr
       <div className="flex items-center justify-between border-b border-border px-4 py-3">
         <div className="flex items-center gap-2">
           {getStatusIcon()}
-          <span className="font-medium">Execution Log</span>
+          <span className="font-medium">{isCheck ? 'Order Check' : 'Execution Log'}</span>
         </div>
         <div className="flex items-center gap-2">
           <span
             className={cn(
               'text-xs px-2 py-0.5 rounded-full',
-              (status === 'running' || status === 'started') && 'bg-amber-500/10 text-amber-500',
-              status === 'success' && 'bg-green-500/10 text-green-500',
-              status === 'error' && 'bg-red-500/10 text-red-500',
+              (status === 'running' || status === 'started' || status === 'checking') &&
+                'bg-amber-500/10 text-amber-500',
+              (status === 'success' || status === 'check-success') &&
+                'bg-green-500/10 text-green-500',
+              (status === 'error' || status === 'check-error') && 'bg-red-500/10 text-red-500',
               status === 'idle' && 'bg-muted text-muted-foreground'
             )}
           >
@@ -107,7 +134,7 @@ export function ExecutionLogPanel({ logs, status, onClose }: ExecutionLogPanelPr
             size="icon"
             className="h-7 w-7"
             onClick={onClose}
-            aria-label="Close execution log"
+            aria-label={isCheck ? 'Close order check' : 'Close execution log'}
           >
             <X className="h-4 w-4" />
           </Button>
@@ -121,7 +148,11 @@ export function ExecutionLogPanel({ logs, status, onClose }: ExecutionLogPanelPr
             <div className="text-center py-8 text-muted-foreground text-sm">
               <Terminal className="h-8 w-8 mx-auto mb-2 opacity-50" />
               <p>No logs yet</p>
-              <p className="text-xs mt-1">Click "Run Now" to execute the workflow</p>
+              <p className="text-xs mt-1">
+                {isCheck
+                  ? 'Click "Check" to validate order legs without placing orders'
+                  : 'Click "Run Now" to execute the workflow'}
+              </p>
             </div>
           ) : (
             logs.map((log, index) => (

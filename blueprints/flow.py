@@ -763,6 +763,32 @@ def execute_workflow_now(workflow_id):
         return jsonify({"error": str(e)}), 500
 
 
+@flow_bp.route("/api/workflows/<int:workflow_id>/preflight", methods=["POST"])
+@check_session_validity
+def preflight_workflow(workflow_id):
+    """Read-only order-leg check for the editor; never creates an execution row."""
+    from database.flow_db import get_workflow, get_workflow_api_key
+    from services.flow_preflight_service import preflight_workflow as run_preflight
+
+    workflow = get_workflow(workflow_id)
+    if not workflow:
+        return jsonify({"error": "Workflow not found"}), 404
+
+    api_key = get_current_api_key() or get_workflow_api_key(workflow)
+    if not api_key:
+        return jsonify({"error": "API key not configured"}), 400
+
+    try:
+        # Business-level check failures are returned as 200 + status="error" so
+        # the editor can render the leg-level logs through its normal response
+        # path. Missing workflow/API key above are request errors.
+        result = run_preflight(workflow, api_key=api_key)
+        return jsonify(result), 200
+    except Exception as e:
+        logger.exception(f"Failed to preflight workflow {workflow_id}: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
 @flow_bp.route("/api/workflows/<int:workflow_id>/executions", methods=["GET"])
 @check_session_validity
 def get_workflow_executions(workflow_id):

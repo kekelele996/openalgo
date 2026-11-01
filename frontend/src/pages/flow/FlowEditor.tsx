@@ -32,6 +32,7 @@ import {
   Pause,
   Play,
   Save,
+  ShieldCheck,
   Sun,
   Terminal,
   Zap,
@@ -44,6 +45,7 @@ import {
   exportWorkflow,
   flowQueryKeys,
   getWorkflow,
+  preflightWorkflow,
   replaceWorkflow,
   updateWorkflow,
 } from '@/api/flow'
@@ -144,6 +146,7 @@ function FlowEditorContent() {
   const [isActive, setIsActive] = useState(false)
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
   const [showLogPanel, setShowLogPanel] = useState(false)
+  const [logPanelKind, setLogPanelKind] = useState<'execution' | 'check'>('execution')
   const [executionLogs, setExecutionLogs] = useState<LogEntry[]>([])
   const [executionStatus, setExecutionStatus] = useState<ExecutionStatus>('idle')
 
@@ -328,6 +331,7 @@ function FlowEditorContent() {
   const executeMutation = useMutation({
     mutationFn: async () => {
       await saveIfDirty()
+      setLogPanelKind('execution')
       setExecutionStatus('running')
       setExecutionLogs([])
       setShowLogPanel(true)
@@ -356,6 +360,32 @@ function FlowEditorContent() {
     },
     onError: (error: Error) => {
       setExecutionStatus('error')
+      setExecutionLogs([{ time: new Date().toISOString(), message: error.message, level: 'error' }])
+      showToast.error(error.message, 'flow')
+    },
+  })
+
+  const preflightMutation = useMutation({
+    mutationFn: async () => {
+      await saveIfDirty()
+      setLogPanelKind('check')
+      setExecutionStatus('checking')
+      setExecutionLogs([])
+      setShowLogPanel(true)
+      return preflightWorkflow(Number(id))
+    },
+    onSuccess: (data) => {
+      setExecutionStatus(data.status === 'success' ? 'check-success' : 'check-error')
+      setExecutionLogs(data.logs as LogEntry[])
+      if (data.status === 'success') {
+        showToast.success(data.message || 'Order check passed', 'flow')
+      } else {
+        showToast.error(data.message || 'Order check found problems', 'flow')
+      }
+    },
+    onError: (error: Error) => {
+      setLogPanelKind('check')
+      setExecutionStatus('check-error')
       setExecutionLogs([{ time: new Date().toISOString(), message: error.message, level: 'error' }])
       showToast.error(error.message, 'flow')
     },
@@ -834,7 +864,12 @@ function FlowEditorContent() {
             variant="outline"
             size="sm"
             onClick={() => saveMutation.mutate()}
-            disabled={saveMutation.isPending || !isModified}
+            disabled={
+              saveMutation.isPending ||
+              !isModified ||
+              executeMutation.isPending ||
+              preflightMutation.isPending
+            }
           >
             {saveMutation.isPending ? (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -843,12 +878,37 @@ function FlowEditorContent() {
             )}
             Save
           </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => preflightMutation.mutate()}
+            disabled={
+              preflightMutation.isPending ||
+              saveMutation.isPending ||
+              executeMutation.isPending ||
+              activateMutation.isPending ||
+              deactivateMutation.isPending
+            }
+            title="Check every order leg with current contracts, quotes and funds without placing orders"
+          >
+            {preflightMutation.isPending ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <ShieldCheck className="mr-2 h-4 w-4" />
+            )}
+            Check
+          </Button>
           {isActive ? (
             <Button
               variant="outline"
               size="sm"
               onClick={() => deactivateMutation.mutate()}
-              disabled={deactivateMutation.isPending || saveMutation.isPending}
+              disabled={
+                deactivateMutation.isPending ||
+                saveMutation.isPending ||
+                executeMutation.isPending ||
+                preflightMutation.isPending
+              }
             >
               {deactivateMutation.isPending ? (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -861,7 +921,12 @@ function FlowEditorContent() {
             <Button
               size="sm"
               onClick={() => activateMutation.mutate()}
-              disabled={activateMutation.isPending || saveMutation.isPending}
+              disabled={
+                activateMutation.isPending ||
+                saveMutation.isPending ||
+                executeMutation.isPending ||
+                preflightMutation.isPending
+              }
             >
               {activateMutation.isPending ? (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -880,7 +945,9 @@ function FlowEditorContent() {
             <DropdownMenuContent align="end">
               <DropdownMenuItem
                 onClick={() => executeMutation.mutate()}
-                disabled={executeMutation.isPending || saveMutation.isPending}
+                disabled={
+                  executeMutation.isPending || saveMutation.isPending || preflightMutation.isPending
+                }
               >
                 Run Now
               </DropdownMenuItem>
@@ -974,6 +1041,7 @@ function FlowEditorContent() {
           <ExecutionLogPanel
             logs={executionLogs}
             status={executionStatus}
+            kind={logPanelKind}
             onClose={() => setShowLogPanel(false)}
           />
         )}

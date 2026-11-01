@@ -50,6 +50,15 @@ export interface ExecutionLog {
   level: string
 }
 
+export interface WorkflowPreflightResult {
+  status: 'success' | 'error'
+  message: string
+  logs: ExecutionLog[]
+  checked_legs: number
+  failed_legs: number
+  failed_nodes: number
+}
+
 export interface WebhookInfo {
   webhook_token: string
   webhook_secret: string
@@ -163,6 +172,14 @@ export async function executeWorkflow(id: number): Promise<{
   logs?: ExecutionLog[]
 }> {
   const response = await webClient.post(`${FLOW_API_BASE}/workflows/${id}/execute`)
+  return response.data
+}
+
+/**
+ * Check order legs with current contracts, quotes and funds without placing orders.
+ */
+export async function preflightWorkflow(id: number): Promise<WorkflowPreflightResult> {
+  const response = await webClient.post(`${FLOW_API_BASE}/workflows/${id}/preflight`)
   return response.data
 }
 
