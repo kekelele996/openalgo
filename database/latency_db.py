@@ -318,15 +318,13 @@ def init_latency_db():
     init_db_with_logging(LatencyBase, latency_engine, "Latency DB", logger)
 
 
-def purge_old_data_logs(days=7):
-    """
-    Purge non-order endpoint latency logs older than specified days.
-    Order execution logs (PLACE, SMART, MODIFY, CANCEL, etc.) are kept forever.
-    """
-    # Order types to keep forever. Must stay in step with the set in
-    # utils.latency_monitor: a type present there but missing here is purged
-    # after a week despite being an order.
-    ORDER_TYPES = {
+#: Order execution latency types, kept permanently: they are the audit trail
+#: an operator compares the broker's order book against. Must stay in step
+#: with the types emitted by utils.latency_monitor - a type present there but
+#: missing here is purged despite being an order. Consumed by the periodic
+#: purge in this module and by services.cleanup_service.
+ORDER_EXECUTION_TYPES = frozenset(
+    {
         "PLACE",
         "SMART",
         "MODIFY",
@@ -341,7 +339,14 @@ def purge_old_data_logs(days=7):
         "GTT_MODIFY",
         "GTT_CANCEL",
     }
+)
 
+
+def purge_old_data_logs(days=7):
+    """
+    Purge non-order endpoint latency logs older than specified days.
+    Order execution logs (PLACE, SMART, MODIFY, CANCEL, etc.) are kept forever.
+    """
     try:
         from datetime import timedelta
 
@@ -350,7 +355,10 @@ def purge_old_data_logs(days=7):
         # Delete non-order logs older than cutoff
         deleted = (
             latency_session.query(OrderLatency)
-            .filter(OrderLatency.timestamp < cutoff, ~OrderLatency.order_type.in_(ORDER_TYPES))
+            .filter(
+                OrderLatency.timestamp < cutoff,
+                ~OrderLatency.order_type.in_(tuple(ORDER_EXECUTION_TYPES)),
+            )
             .delete(synchronize_session=False)
         )
 

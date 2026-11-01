@@ -2,6 +2,8 @@ import type {
   AddFreezeQtyRequest,
   AddHolidayRequest,
   AdminStats,
+  CleanupJob,
+  CleanupPreview,
   DiagnosticsResponse,
   ErrorGroupsResponse,
   ErrorsListResponse,
@@ -278,5 +280,47 @@ export const adminApi = {
       payload
     )
     return response.data
+  },
+
+  // ============================================================================
+  // Record cleanup APIs
+  // ============================================================================
+
+  getCleanupPreview: async (days?: Record<string, number>): Promise<CleanupPreview> => {
+    const response = await webClient.post<{ status: string; preview: CleanupPreview }>(
+      '/admin/api/cleanup/preview',
+      { days: days ?? {} }
+    )
+    return response.data.preview
+  },
+
+  createCleanupJob: async (days: Record<string, number>): Promise<CleanupJob> => {
+    const response = await webClient.post<{ status: string; job: CleanupJob }>(
+      '/admin/api/cleanup/jobs',
+      { days }
+    )
+    return response.data.job
+  },
+
+  getLatestCleanupJob: async (): Promise<CleanupJob | null> => {
+    const response = await webClient.get<{ status: string; job: CleanupJob | null }>(
+      '/admin/api/cleanup/jobs/latest'
+    )
+    return response.data.job
+  },
+
+  getCleanupJob: async (jobId: string): Promise<CleanupJob> => {
+    const response = await webClient.get<{ status: string; job: CleanupJob }>(
+      `/admin/api/cleanup/jobs/${jobId}`
+    )
+    return response.data.job
+  },
+
+  runCleanupNext: async (jobId: string, maxOps = 20): Promise<CleanupJob> => {
+    const response = await webClient.post<{ status: string; job: CleanupJob }>(
+      `/admin/api/cleanup/jobs/${jobId}/next`,
+      { max_ops: maxOps }
+    )
+    return response.data.job
   },
 }

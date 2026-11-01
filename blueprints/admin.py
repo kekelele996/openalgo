@@ -385,7 +385,10 @@ def api_holiday_add():
         # Validate special session has open exchanges with timings
         if holiday_type == "SPECIAL_SESSION" and not open_exchanges:
             return jsonify(
-                {"status": "error", "message": "Special session requires at least one exchange with timings"}
+                {
+                    "status": "error",
+                    "message": "Special session requires at least one exchange with timings",
+                }
             ), 400
 
         holiday_date = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -945,9 +948,9 @@ def api_errors_client_report():
 
         message = _scrub_control_chars(str(data.get("message") or ""))[:_MAX_CLIENT_MESSAGE_LEN]
         stack = _scrub_control_chars(str(data.get("stack") or ""))[:_MAX_CLIENT_STACK_LEN]
-        url = _sanitize_client_error_url(
-            _scrub_control_chars(str(data.get("url") or ""))
-        )[:_MAX_CLIENT_URL_LEN]
+        url = _sanitize_client_error_url(_scrub_control_chars(str(data.get("url") or "")))[
+            :_MAX_CLIENT_URL_LEN
+        ]
         component_stack = _scrub_control_chars(str(data.get("component_stack") or ""))[
             :_MAX_CLIENT_COMPONENT_STACK_LEN
         ]
@@ -1924,7 +1927,11 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
     lines = []
     lines.append(f"{h1}OpenAlgo System Report")
     lines.append("")
-    lines.append(_md_kv("Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")) if is_md else f"Generated: {datetime.now()}")
+    lines.append(
+        _md_kv("Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if is_md
+        else f"Generated: {datetime.now()}"
+    )
     lines.append("")
 
     mode = payload.get("mode") or {}
@@ -1989,11 +1996,16 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
     lines.append(_md_kv("Memory used (%)", hw.get("memory_percent")))
     if hw.get("disk_log"):
         lines.append(
-            _md_kv("Disk log", f"{hw['disk_log']['free_gb']} GB free of {hw['disk_log']['total_gb']} GB")
+            _md_kv(
+                "Disk log",
+                f"{hw['disk_log']['free_gb']} GB free of {hw['disk_log']['total_gb']} GB",
+            )
         )
     if hw.get("disk_db"):
         lines.append(
-            _md_kv("Disk db", f"{hw['disk_db']['free_gb']} GB free of {hw['disk_db']['total_gb']} GB")
+            _md_kv(
+                "Disk db", f"{hw['disk_db']['free_gb']} GB free of {hw['disk_db']['total_gb']} GB"
+            )
         )
     lines.append("")
 
@@ -2032,7 +2044,9 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
     lines.append(f"{h2}Brokers")
     lines.append(_md_kv("Active broker", brokers.get("active_broker")))
     lines.append(_md_kv("User logged in", brokers.get("user_logged_in")))
-    lines.append(_md_kv("Configured", ", ".join(brokers.get("configured_brokers") or []) or "_none_"))
+    lines.append(
+        _md_kv("Configured", ", ".join(brokers.get("configured_brokers") or []) or "_none_")
+    )
     lines.append("")
 
     dbs = payload.get("databases") or []
@@ -2069,7 +2083,11 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
             lvl = entry.get("level", "?")
             mod = entry.get("module", "?")
             msg = _strip_ansi(entry.get("message", ""))[:500]
-            lines.append(f"{bullet}`{ts}` **{lvl}** in `{mod}`: {msg}" if is_md else f"  - [{ts}] {lvl} in {mod}: {msg}")
+            lines.append(
+                f"{bullet}`{ts}` **{lvl}** in `{mod}`: {msg}"
+                if is_md
+                else f"  - [{ts}] {lvl} in {mod}: {msg}"
+            )
         lines.append("")
 
     body = "\n".join(lines)
@@ -2272,9 +2290,7 @@ def api_oauth_client_approve(client_id):
             f"[OAuth admin] approved client_id={client_id} "
             f"by user={request.headers.get('X-Forwarded-User') or 'session'}"
         )
-        return jsonify(
-            {"status": "success", "client": _serialize_oauth_client(client)}
-        )
+        return jsonify({"status": "success", "client": _serialize_oauth_client(client)})
     except Exception as e:
         logger.exception(f"Error approving OAuth client: {e}")
         return jsonify({"status": "error", "message": "Failed to approve."}), 500
@@ -2312,8 +2328,7 @@ def api_oauth_client_revoke(client_id):
 
         revoked_count = revoke_client(client_id, "admin_revoke")
         logger.warning(
-            f"[OAuth admin] REVOKE client_id={client_id} "
-            f"({revoked_count} tokens) by session"
+            f"[OAuth admin] REVOKE client_id={client_id} ({revoked_count} tokens) by session"
         )
         return jsonify(
             {
@@ -2389,8 +2404,17 @@ def api_mcp_audit():
         # whitelist stops it from leaking through this endpoint
         # (security review finding M-3).
         _AUDIT_KEYS = frozenset(
-            {"ts", "jti", "client_id", "tool", "scope", "params_hash",
-             "duration_ms", "outcome", "request_ip"}
+            {
+                "ts",
+                "jti",
+                "client_id",
+                "tool",
+                "scope",
+                "params_hash",
+                "duration_ms",
+                "outcome",
+                "request_ip",
+            }
         )
 
         def _sanitize_audit(entry: dict) -> dict:
@@ -2454,7 +2478,7 @@ def api_mcp_kill_switch():
         return jsonify(
             {
                 "status": "error",
-                "message": "Kill switch requires confirm=\"REVOKE_ALL_MCP_TOKENS\".",
+                "message": 'Kill switch requires confirm="REVOKE_ALL_MCP_TOKENS".',
             }
         ), 400
 
@@ -2611,7 +2635,10 @@ def api_mcp_settings_put():
         public_url = public_url.strip().rstrip("/")
         if public_url and not re.match(r"^https://[A-Za-z0-9.\-]+(:\d+)?(/.*)?$", public_url):
             return jsonify(
-                {"status": "error", "message": "public_url must be HTTPS (e.g. https://yourdomain.com)."}
+                {
+                    "status": "error",
+                    "message": "public_url must be HTTPS (e.g. https://yourdomain.com).",
+                }
             ), 400
 
     # Pre-flight: enabling MCP must not produce a config that refuses to boot.
@@ -2627,7 +2654,9 @@ def api_mcp_settings_put():
                     ),
                 }
             ), 400
-        effective_url = public_url if public_url is not None else (os.getenv("MCP_PUBLIC_URL") or "").strip()
+        effective_url = (
+            public_url if public_url is not None else (os.getenv("MCP_PUBLIC_URL") or "").strip()
+        )
         if not effective_url:
             return jsonify(
                 {
@@ -2642,9 +2671,7 @@ def api_mcp_settings_put():
     env_path = _resolve_env_path()
     if not env_path.exists():
         logger.error(f"[MCP admin] .env not found at {env_path}")
-        return jsonify(
-            {"status": "error", "message": f".env not found at {env_path}"}
-        ), 500
+        return jsonify({"status": "error", "message": f".env not found at {env_path}"}), 500
 
     try:
         # One hold across every key, so a save from another tab cannot land
@@ -2686,3 +2713,139 @@ def api_mcp_settings_put():
             "settings_pending": _mcp_settings_payload(),  # what's in .env now
         }
     )
+
+
+# ============================================================================
+# Record Cleanup: preview, resumable batched deletion
+# ============================================================================
+#
+# All endpoints are session-gated and rate-limited like the rest of the admin
+# API. The preview never mutates anything; deletion only happens through a
+# persisted job advanced one handful of batches at a time, so a failed batch
+# never rolls back finished ones and a retry touches only what remains.
+
+_CLEANUP_PREVIEW_RATE = "10/minute"
+_CLEANUP_JOB_RATE = "6/minute"
+_CLEANUP_NEXT_RATE = "120/minute"
+
+
+def _cleanup_days_from_request():
+    """Pull and lightly validate the {days: {category: n}} body fragment."""
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return None, (jsonify({"status": "error", "message": "Request body must be JSON."}), 400)
+    days = data.get("days", {})
+    if days is not None and not isinstance(days, dict):
+        return None, (
+            jsonify({"status": "error", "message": "Retention periods must be a JSON object."}),
+            400,
+        )
+    max_ops = data.get("max_ops")
+    if max_ops is not None:
+        try:
+            max_ops = int(max_ops)
+        except (TypeError, ValueError):
+            return None, (
+                jsonify({"status": "error", "message": "Batch count must be a whole number."}),
+                400,
+            )
+        if not 1 <= max_ops <= 200:
+            return None, (
+                jsonify({"status": "error", "message": "Batch count must be between 1 and 200."}),
+                400,
+            )
+    return {"days": days, "max_ops": max_ops}, None
+
+
+@admin_bp.route("/api/cleanup/preview", methods=["POST"])
+@check_session_validity
+@limiter.limit(_CLEANUP_PREVIEW_RATE)
+def api_cleanup_preview():
+    """Preview what deleting past each category's retention window would do."""
+    parsed, error = _cleanup_days_from_request()
+    if error:
+        return error
+    try:
+        from services import cleanup_service
+
+        preview = cleanup_service.build_preview(parsed["days"])
+        resp = jsonify({"status": "success", "preview": preview})
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+        return resp
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    except Exception as e:
+        logger.exception(f"Error building cleanup preview: {e}")
+        return jsonify({"status": "error", "message": "Could not build the cleanup preview."}), 500
+
+
+@admin_bp.route("/api/cleanup/jobs", methods=["POST"])
+@check_session_validity
+@limiter.limit(_CLEANUP_JOB_RATE)
+def api_cleanup_create_job():
+    """Create a cleanup job from the confirmed retention periods."""
+    parsed, error = _cleanup_days_from_request()
+    if error:
+        return error
+    try:
+        from services import cleanup_service
+
+        job = cleanup_service.create_job(parsed["days"])
+        logger.info(f"[Cleanup] job {job['job_id']} created")
+        return jsonify({"status": "success", "job": job})
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    except Exception as e:
+        logger.exception(f"Error creating cleanup job: {e}")
+        return jsonify({"status": "error", "message": "Could not start the cleanup."}), 500
+
+
+@admin_bp.route("/api/cleanup/jobs/latest", methods=["GET"])
+@check_session_validity
+@limiter.limit(_CLEANUP_PREVIEW_RATE)
+def api_cleanup_latest_job():
+    """Return the newest cleanup job so a reload can resume a partial run."""
+    try:
+        from services import cleanup_service
+
+        return jsonify({"status": "success", "job": cleanup_service.latest_job()})
+    except Exception as e:
+        logger.exception(f"Error reading latest cleanup job: {e}")
+        return jsonify({"status": "error", "message": "Could not read the cleanup status."}), 500
+
+
+@admin_bp.route("/api/cleanup/jobs/<job_id>", methods=["GET"])
+@check_session_validity
+@limiter.limit(_CLEANUP_NEXT_RATE)
+def api_cleanup_get_job(job_id):
+    """Return one cleanup job's state."""
+    try:
+        from services import cleanup_service
+
+        job = cleanup_service.get_job(job_id)
+        if job is None:
+            return jsonify({"status": "error", "message": "Cleanup job not found."}), 404
+        return jsonify({"status": "success", "job": job})
+    except Exception as e:
+        logger.exception(f"Error reading cleanup job: {e}")
+        return jsonify({"status": "error", "message": "Could not read the cleanup status."}), 500
+
+
+@admin_bp.route("/api/cleanup/jobs/<job_id>/next", methods=["POST"])
+@check_session_validity
+@limiter.limit(_CLEANUP_NEXT_RATE)
+def api_cleanup_run_next(job_id):
+    """Run the next batches of a job; retries failed batches with what remains."""
+    parsed, error = _cleanup_days_from_request()
+    if error:
+        return error
+    try:
+        from services import cleanup_service
+
+        job = cleanup_service.run_next(job_id, max_ops=parsed["max_ops"] or 20)
+        return jsonify({"status": "success", "job": job})
+    except KeyError:
+        return jsonify({"status": "error", "message": "Cleanup job not found."}), 404
+    except Exception as e:
+        logger.exception(f"Error running cleanup job {job_id}: {e}")
+        return jsonify({"status": "error", "message": "Could not continue the cleanup."}), 500

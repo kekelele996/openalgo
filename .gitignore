@@ -51,6 +51,9 @@ db/strategy_encryption.key
 # DB backup files (created by upgrade/rotate_pepper.py and other migrations)
 db/backups/
 
+# Resumable record-cleanup job state (services/cleanup_service.py)
+db/cleanup_jobs/
+
 # CSV Files (except specific data files)
 *.csv
 !symbols.csv

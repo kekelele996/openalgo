@@ -17,6 +17,7 @@ import { adminApi } from '@/api/admin'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import type { AdminStats } from '@/types/admin'
+import StorageCleanup from './StorageCleanup'
 
 export default function AdminIndex() {
   const [stats, setStats] = useState<AdminStats | null>(null)
@@ -134,6 +135,9 @@ export default function AdminIndex() {
           Manage system settings, market data, and configurations
         </p>
       </div>
+
+      {/* Storage cleanup preview and batched deletion, inline on this page */}
+      <StorageCleanup />
 
       {/* Admin Cards Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">

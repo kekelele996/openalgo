@@ -399,3 +399,88 @@ export interface MCPSettingsUpdateResponse {
   restart_command?: string
   settings_pending?: MCPSettings
 }
+
+// ============================================================================
+// Record cleanup — preview and resumable batched deletion
+// ============================================================================
+
+export interface CleanupSkip {
+  reason: string
+  count: number
+  bytes?: number
+  samples: string[]
+}
+
+export interface CleanupCategory {
+  id: string
+  label: string
+  description: string
+  unit: string
+  retention_days: number
+  cutoff: string
+  effective_cutoff: string
+  total_count: number
+  delete_count: number
+  keep_count: number
+  skip_count: number
+  delete_bytes: number
+  skips: CleanupSkip[]
+}
+
+export interface CleanupDiskUsage {
+  total_gb: number
+  free_gb: number
+  used_percent: number
+}
+
+export interface CleanupPreview {
+  generated_at: string
+  days: Record<string, number>
+  categories: CleanupCategory[]
+  totals: {
+    delete_count: number
+    delete_bytes: number
+    skip_count: number
+  }
+  disk: {
+    log: CleanupDiskUsage | null
+    db: CleanupDiskUsage | null
+  }
+}
+
+export type CleanupCategoryStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+
+export interface CleanupFileItem {
+  path: string
+  size: number
+  status: 'pending' | 'done' | 'failed'
+  error: string | null
+}
+
+export interface CleanupCategoryState {
+  kind: 'db' | 'jsonl' | 'files'
+  status: CleanupCategoryStatus
+  planned_delete: number
+  deleted?: number
+  bytes_freed: number
+  delete_bytes?: number
+  cursor?: number
+  cutoff?: string
+  error: string | null
+  items?: CleanupFileItem[]
+}
+
+export type CleanupJobStatus = 'running' | 'complete' | 'partial' | 'failed'
+
+export interface CleanupJob {
+  job_id: string
+  created_at: string
+  status: CleanupJobStatus
+  days: Record<string, number>
+  plans: Record<string, CleanupCategory>
+  categories: Record<string, CleanupCategoryState>
+  totals_freed: {
+    count: number
+    bytes: number
+  }
+}
