@@ -2,12 +2,14 @@ import { ArrowLeft, Calendar, Clock } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { pythonStrategyApi } from '@/api/python-strategy'
+import { SessionPlanPreview } from '@/components/SessionPlanPreview'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useStrategyExchanges } from '@/hooks/useStrategyExchanges'
+import type { SessionPlan } from '@/lib/sessionSchedule'
 import type { PythonStrategy } from '@/types/python-strategy'
 import { CRYPTO_EXCHANGE_VALUE, SCHEDULE_DAYS } from '@/types/python-strategy'
 import { showToast } from '@/utils/toast'
@@ -25,9 +27,64 @@ export default function SchedulePythonStrategy() {
   const [selectedDays, setSelectedDays] = useState<string[]>(['mon', 'tue', 'wed', 'thu', 'fri'])
   const [runAllDay, setRunAllDay] = useState(false)
 
+  // Concrete next start / mandatory stop resolved against the exchange
+  // calendar for the inputs currently in the form.
+  const [plan, setPlan] = useState<SessionPlan | null>(null)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const allDay = exchange === CRYPTO_EXCHANGE_VALUE && runAllDay
+
+  useEffect(() => {
+    if (!strategy) return
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      setPreviewLoading(true)
+      try {
+        const result = await pythonStrategyApi.schedulePreview({
+          exchange,
+          start: allDay ? null : startTime,
+          stop: allDay ? null : stopTime,
+          days: allDay ? ALL_DAYS : selectedDays,
+        })
+        if (!cancelled) setPlan(result)
+      } catch (error) {
+        if (cancelled) return
+        const body = (error as { response?: { data?: { message?: string; reason?: string } } })
+          ?.response?.data
+        setPlan(
+          body
+            ? {
+                exchange,
+                kind: 'regular',
+                blocked: true,
+                startable: false,
+                reason: body.reason ?? 'calendar_unavailable',
+                description: null,
+                is_special: false,
+                session_date: null,
+                session_start: null,
+                session_end: null,
+                effective_start: null,
+                effective_end: null,
+                next_start: null,
+                must_stop: null,
+                session_label: '',
+                message: body.message ?? 'Schedule could not be resolved',
+              }
+            : null
+        )
+      } finally {
+        if (!cancelled) setPreviewLoading(false)
+      }
+    }, 300)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+    // strategy gates the preview until the saved exchange/times are loaded.
+  }, [strategy, exchange, startTime, stopTime, allDay, selectedDays])
+
   const { exchanges: brokerExchanges, getWindow } = useStrategyExchanges()
   const isCrypto = exchange === CRYPTO_EXCHANGE_VALUE
-  const allDay = isCrypto && runAllDay
   const sessionWindow = getWindow(exchange)
   // The list is the broker's, but a strategy saved before it was may carry an
   // exchange outside it. Keep that one on offer, or the dropdown would show a
@@ -329,6 +386,14 @@ export default function SchedulePythonStrategy() {
                 </div>
               </>
             )}
+
+            {/* Concrete times resolved against the actual session: next open
+                clipped to a special/evening session, mandatory close on an
+                early-close day. */}
+            <div className="space-y-1.5">
+              <Label className="text-xs">Resolved schedule</Label>
+              <SessionPlanPreview plan={plan} loading={previewLoading} />
+            </div>
 
             {/* Submit */}
             <div className="flex gap-3 pt-4">

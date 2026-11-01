@@ -1,5 +1,8 @@
 // Python Strategy Types
 
+import type { SessionPlan } from '@/lib/sessionSchedule'
+import type { ApiResponse } from '@/types/trading'
+
 export interface PythonStrategy {
   id: string
   name: string
@@ -16,6 +19,13 @@ export interface PythonStrategy {
   schedule_start_time: string | null
   schedule_stop_time: string | null
   schedule_days: string[]
+  // Concrete session-resolved instants written by the daily arm pass.
+  next_start: string | null
+  armed_start: string | null
+  must_stop: string | null
+  session_label: string | null
+  session_active: boolean
+  schedule_blocked_reason: string | null
   created_at: string
   updated_at: string
 }
@@ -55,6 +65,11 @@ export interface ScheduleConfig {
   stop_time: string | null
   days: string[]
   exchange?: string
+}
+
+/** Result of saving a schedule: the concrete plan it was armed against. */
+export interface ScheduleSaveResponse extends ApiResponse<void> {
+  plan?: SessionPlan | null
 }
 
 // Exchanges that drive the strategy's calendar/holiday awareness in /python.

@@ -38,6 +38,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { formatIst } from '@/lib/sessionSchedule'
 import type { MasterContractStatus, PythonStrategy } from '@/types/python-strategy'
 import {
   CRYPTO_EXCHANGE_VALUE,
@@ -460,6 +461,34 @@ export default function PythonStrategyIndex() {
                         : ['mon', 'tue', 'wed', 'thu', 'fri']
                     )}
                   </p>
+                  {/* Concrete session-resolved instants from the arm pass:
+                      holidays, special sessions and evening sessions are
+                      already folded into these times. */}
+                  {strategy.schedule_blocked_reason === 'calendar_unavailable' ? (
+                    <p className="mt-1.5 text-xs font-medium text-red-600 dark:text-red-400">
+                      Trading calendar unavailable — not started
+                    </p>
+                  ) : (
+                    strategy.armed_start && (
+                      <div className="mt-1.5 space-y-0.5 text-xs">
+                        <div className="flex justify-between gap-2">
+                          <span className="text-muted-foreground">Next start</span>
+                          <span className="font-medium">{formatIst(strategy.armed_start)}</span>
+                        </div>
+                        <div className="flex justify-between gap-2">
+                          <span className="text-muted-foreground">Must stop by</span>
+                          <span className="font-medium">
+                            {formatIst(strategy.must_stop) ?? 'Never (24/7)'}
+                          </span>
+                        </div>
+                        {strategy.session_label && (
+                          <p className="pt-0.5 text-[11px] text-amber-700 dark:text-amber-400">
+                            {strategy.session_label}
+                          </p>
+                        )}
+                      </div>
+                    )
+                  )}
                 </div>
 
                 {/* Error Message */}

@@ -3,9 +3,10 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { Copy, Eye, EyeOff, Info, Loader2, Settings2, Trash2, X } from 'lucide-react'
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useParams } from 'react-router'
-import { flowQueryKeys, getIndexSymbolsLotSizes, getWebhookInfo } from '@/api/flow'
+import { flowQueryKeys, getIndexSymbolsLotSizes, getWebhookInfo, previewSchedule } from '@/api/flow'
+import { SessionPlanPreview } from '@/components/SessionPlanPreview'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -38,6 +39,7 @@ import {
   SCHEDULE_TYPES,
   strikeOffsetOptions,
 } from '@/lib/flow/constants'
+import type { SessionPlan } from '@/lib/sessionSchedule'
 import { cn } from '@/lib/utils'
 import { useFlowWorkflowStore } from '@/stores/flowWorkflowStore'
 import type { BasketOrderItem } from '@/types/flow'
@@ -48,6 +50,69 @@ import { showToast } from '@/utils/toast'
  * value, and the node stores the absence of a product rather than this string.
  */
 const BASKET_PRODUCT_AUTO = 'AUTO'
+
+/**
+ * Live read-only preview of the concrete next start / mandatory stop the
+ * trigger would arm, resolved against the selected exchange's calendar.
+ * Debounced so editing the form does not fire a request per keystroke; the
+ * 503 fail-closed answer (calendar unreadable) is rendered as a blocked plan.
+ */
+function StartSchedulePreview({ data }: { data: Record<string, unknown> }) {
+  const scheduleType = data.scheduleType as string | undefined
+  const [plan, setPlan] = useState<SessionPlan | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const payload = JSON.stringify(data)
+
+  useEffect(() => {
+    if (!scheduleType || scheduleType === 'manual') {
+      setPlan(null)
+      return
+    }
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      setLoading(true)
+      try {
+        const result = await previewSchedule(JSON.parse(payload) as Record<string, unknown>)
+        if (!cancelled) setPlan(result)
+      } catch (error) {
+        if (cancelled) return
+        const body = (error as { response?: { data?: { message?: string; reason?: string } } })
+          ?.response?.data
+        setPlan(
+          body
+            ? ({
+                exchange: String(data.marketHoursExchange || 'NSE'),
+                kind: 'regular',
+                blocked: true,
+                startable: false,
+                reason: body.reason ?? 'calendar_unavailable',
+                description: null,
+                is_special: false,
+                session_date: null,
+                session_start: null,
+                session_end: null,
+                effective_start: null,
+                effective_end: null,
+                next_start: null,
+                must_stop: null,
+                session_label: '',
+                message: body.message ?? 'Schedule could not be resolved',
+              } satisfies SessionPlan)
+            : null
+        )
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }, 300)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [payload, scheduleType, data.marketHoursExchange])
+
+  return <SessionPlanPreview plan={plan} loading={loading} />
+}
 
 import { CustomLegsFields } from './CustomLegsFields'
 import { IndicatorParamsFields } from './IndicatorParamsFields'
@@ -544,6 +609,13 @@ export function ConfigPanel() {
                     </p>
                   </>
                 )}
+
+                <Separator />
+
+                {/* Concrete next start / mandatory stop resolved against the
+                    exchange calendar (special sessions, early closes, MCX
+                    evening sessions). Read-only; activation arms these. */}
+                <StartSchedulePreview data={nodeData} />
               </>
             )}
 

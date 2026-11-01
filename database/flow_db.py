@@ -602,7 +602,10 @@ def update_execution_status(execution_id, status, error=None, logs=None):
 
         if status == "running" and not execution.started_at:
             execution.started_at = func.now()
-        elif status in ["completed", "failed"]:
+        elif status in ["completed", "failed", "skipped"]:
+            # "skipped" is a scheduled fire the market-hours gate refused
+            # (holiday/special session/shortened hours/unreadable calendar);
+            # it is terminal and carries its reason in `error`.
             execution.completed_at = func.now()
 
         db_session.commit()

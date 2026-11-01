@@ -2,6 +2,7 @@
 // Flow Workflow API module
 
 import type { Edge, Node } from '@xyflow/react'
+import type { SessionPlan } from '@/lib/sessionSchedule'
 import { webClient } from './client'
 
 // =============================================================================
@@ -130,6 +131,18 @@ export async function updateWorkflow(
 export async function deleteWorkflow(id: number): Promise<{ status: string; message: string }> {
   const response = await webClient.delete(`${FLOW_API_BASE}/workflows/${id}`)
   return response.data
+}
+
+/**
+ * Preview the concrete next start / mandatory stop a start-node config would
+ * arm, resolved against the exchange calendar. Read-only.
+ */
+export async function previewSchedule(data: Record<string, unknown>): Promise<SessionPlan> {
+  const response = await webClient.post<{ plan: SessionPlan }>(
+    `${FLOW_API_BASE}/schedule-preview`,
+    data
+  )
+  return response.data.plan
 }
 
 /**

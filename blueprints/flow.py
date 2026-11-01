@@ -462,20 +462,18 @@ def _register_trigger(workflow_id, trigger_type, trigger_data, api_key):
     if trigger_type == "start":
         schedule_type = trigger_data.get("scheduleType")
         if schedule_type and schedule_type != "manual":
+            from services.flow_scheduler_service import arm_workflow_session_job
+
             scheduler = get_flow_scheduler()
             scheduler.set_api_key(api_key)
 
-            job_id = scheduler.add_workflow_job(
-                workflow_id=workflow_id,
-                schedule_type=schedule_type,
-                time_str=trigger_data.get("time", "09:15"),
-                days=trigger_data.get("days"),
-                execute_at=trigger_data.get("executeAt"),
-                interval_value=trigger_data.get("intervalValue"),
-                interval_unit=trigger_data.get("intervalUnit"),
-                # Offered by the editor and defaulted on, but never read
-                # before, so schedules kept firing overnight and at weekends.
-                market_hours_only=bool(trigger_data.get("marketHoursOnly", False)),
+            # Resolve concrete next-start/must-stop instants against the
+            # exchange calendar and arm those. A blocked schedule (no
+            # qualifying session, one-shot in the past) or an unreadable
+            # calendar raises here; activation rolls back rather than going
+            # active with a job that cannot fire.
+            job_id, _plan = arm_workflow_session_job(
+                workflow_id, trigger_data=trigger_data
             )
             if not set_schedule_job_id(workflow_id, job_id):
                 # Without the stored id, deactivation cannot find the job.
@@ -560,6 +558,35 @@ def _rollback_activation(workflow_id):
                 f"Could not roll back the {what} for workflow {workflow_id} after a "
                 "failed activation; it may need to be deactivated manually"
             )
+
+
+@flow_bp.route("/api/schedule-preview", methods=["POST"])
+@check_session_validity
+def schedule_preview():
+    """Preview the concrete next start / must stop for a start-node config.
+
+    Lets the existing start-node panel show which exchange session will be
+    used and when the schedule will actually fire, before activation. Read
+    only and does not touch the scheduler.
+    """
+    from services import session_schedule
+
+    data = request.get_json(silent=True) or {}
+    try:
+        plan = session_schedule.plan_for_flow_trigger(data)
+    except session_schedule.CalendarUnavailable as exc:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "blocked": True,
+                    "reason": "calendar_unavailable",
+                    "message": str(exc),
+                }
+            ),
+            503,
+        )
+    return jsonify({"status": "success", "plan": plan.to_dict()})
 
 
 @flow_bp.route("/api/workflows/<int:workflow_id>/activate", methods=["POST"])

@@ -16,6 +16,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  SkipForward,
   Trash2,
   Upload,
   Webhook,
@@ -73,6 +74,10 @@ function StatusIcon({ status }: { status: string | null }) {
       return <Loader2 className="h-4 w-4 animate-spin text-primary" />
     case 'pending':
       return <Clock className="h-4 w-4 text-muted-foreground" />
+    case 'skipped':
+      // A scheduled fire the market-hours gate refused (holiday/special
+      // hours); the reason is on the execution row.
+      return <SkipForward className="h-4 w-4 text-muted-foreground" />
     default:
       return <AlertCircle className="h-4 w-4 text-muted-foreground" />
   }

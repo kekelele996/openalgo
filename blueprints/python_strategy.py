@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 import uuid
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from time import monotonic, sleep
 
@@ -25,6 +25,7 @@ import psutil
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from flask import (
     Blueprint,
     Response,
@@ -1657,18 +1658,26 @@ def scheduled_start_strategy(strategy_id: str):
     exch = normalize_exchange(config.get("exchange"))
 
     if is_trading_day_enforcement_enabled():
-        status = get_market_status(exch)
-        if not status.get("is_trading"):
-            reason = status.get("reason") or "holiday"
-            message = status.get("message", f"{exch} closed today")
-            logger.warning(f"Strategy {strategy_id} ({exch}) scheduled start BLOCKED - {message}")
+        # Gate on the *effective* window (user schedule intersected with the
+        # exchange's actual session), not on "has any session today". On a
+        # Muhurat Sunday the exchange does trade, but at 09:15 its special
+        # session has not opened; a plain is_trading check started the
+        # strategy five hours early. is_within_schedule_time also fails
+        # closed (False) when the calendar cannot be read.
+        if not is_within_schedule_time(strategy_id):
+            status = get_market_status(exch)
+            reason = status.get("reason") or "outside_session"
+            message = status.get("message", f"{exch} session is not open now")
+            logger.warning(
+                f"Strategy {strategy_id} ({exch}) scheduled start BLOCKED - {message}"
+            )
             _update_config(strategy_id, {"paused_reason": reason, "paused_message": message})
             return
 
     # Clear any previous paused reason
     _update_config(strategy_id, pop=("paused_reason", "paused_message"), save=False)
 
-    logger.info(f"Strategy {strategy_id} ({exch}) - all checks passed, starting")
+    logger.info(f"Strategy {strategy_id} ({exch}) - within its session, starting")
     _start_unless_stopped_by_trader(strategy_id)
 
 
@@ -1762,6 +1771,24 @@ def daily_trading_day_check():
             logger.info(f"Daily cleanup: stopped {stopped_count} strategies")
         else:
             logger.debug("Daily cleanup: no strategies needed stopping")
+
+        # Re-arm every scheduled strategy against today's concrete sessions.
+        # The start/stop jobs are one-shot DateTriggers, so after midnight the
+        # previous day's jobs are spent; this is the daily rollover that turns
+        # "09:15 on a weekday" into today's actual open and the early/special
+        # close into the actual mandatory stop.
+        armed_count = 0
+        for strategy_id, arm_config in snapshot_strategy_configs():
+            if not arm_config.get("is_scheduled"):
+                continue
+            try:
+                arm_strategy_session(strategy_id)
+                armed_count += 1
+            except Exception:
+                logger.exception(f"Daily re-arm failed for strategy {strategy_id}")
+        if armed_count:
+            save_configs()
+            logger.debug(f"Daily re-arm: resolved sessions for {armed_count} strategies")
 
     except Exception as e:
         logger.exception(f"Error in daily trading day check: {e}")
@@ -1867,8 +1894,40 @@ def market_hours_enforcer():
                 continue
 
             exch = normalize_exchange(config.get("exchange"))
-            status = get_market_status(exch)
             schedule_days = [d.lower() for d in config.get("schedule_days", [])]
+
+            # A prior arm failed with an unreadable calendar (fail closed).
+            # The reads are cached and cheap; retrying once a minute means a
+            # strategy arms itself as soon as the calendar is back instead of
+            # waiting for the next 00:01 rollover.
+            if config.get("schedule_blocked_reason") == "calendar_unavailable":
+                result = arm_strategy_session(strategy_id)
+                if result and result.get("blocked"):
+                    continue
+                config = get_strategy_config(strategy_id) or config
+
+            status = get_market_status(exch)
+
+            # Mandatory-stop safety net: the exchange had a session today but
+            # it is over (an early/special close). The concrete stop job is
+            # the primary enforcement; this covers a missed or busy scheduler
+            # and makes "must stop at the session close" hold even when the
+            # user's own stop time was later.
+            if status.get("reason") == "after_market" and _is_strategy_running(
+                strategy_id, config
+            ):
+                message = status.get("message", f"{exch} session closed")
+                logger.info(
+                    f"Enforcer: stopping {strategy_id} ({exch}) - session ended - {message}"
+                )
+                stop_strategy_process(strategy_id)
+                _update_config(
+                    strategy_id,
+                    {"paused_reason": "after_market", "paused_message": message},
+                    save=False,
+                )
+                stopped_count += 1
+                continue
 
             if status.get("is_trading"):
                 # Exchange tradeable today — clear any stale pause reason
@@ -2000,10 +2059,209 @@ def cleanup_strategy_logs(strategy_id: str):
         logger.exception(f"Error cleaning up logs for strategy {strategy_id}: {e}")
 
 
+#: Paused reasons that come from session resolution rather than a live
+#: enforcer stop. Both the status badge and the retry path key off them.
+SCHEDULE_BLOCKED_REASONS = (
+    "calendar_unavailable",
+    "window_misses_session",
+    "no_session_in_days",
+    "invalid_time",
+    "time_in_the_past",
+)
+
+
+def _remove_scheduler_job(job_id: str) -> bool:
+    """Remove one scheduler job. Tolerates a scheduler that is not up yet."""
+    if SCHEDULER is None:
+        return False
+    try:
+        if SCHEDULER.get_job(job_id):
+            SCHEDULER.remove_job(job_id)
+            return True
+    except Exception:
+        logger.exception(f"Could not remove scheduler job {job_id}")
+    return False
+
+
+def arm_strategy_session(strategy_id: str, now=None) -> dict | None:
+    """Resolve the strategy's next concrete session and arm start/stop jobs.
+
+    Replaces the old fixed HH:MM weekday crons. The two jobs installed are
+    absolute :class:`DateTrigger` moments:
+
+      * start — the next session's effective open (user start clipped into
+        the exchange's actual session);
+      * stop  — the adopted session's effective close (user stop clipped
+        back to the early/special close).
+
+    Fail closed: when the calendar store cannot be read no start job is
+    installed and the strategy is marked ``calendar_unavailable``. Saving a
+    schedule never surprise-starts a strategy, so when the arm lands inside
+    an open window the start job targets the *next* session instead of
+    "now"; the existing Start button still starts immediately.
+
+    Returns the plan payload stored on the config, or None if the strategy
+    no longer exists.
+    """
+    from services import session_schedule
+
+    config = get_strategy_config(strategy_id)
+    if config is None:
+        return None
+
+    exch = normalize_exchange(config.get("exchange"))
+    user_start = config.get("schedule_start")
+    user_stop = config.get("schedule_stop")
+    # A blank stop means "never auto-stop" (the 24/7 crypto case); such a
+    # strategy gets no stop job at all, rather than one at the session edge.
+    has_user_stop = bool(user_stop)
+    days = config.get("schedule_days") or ["mon", "tue", "wed", "thu", "fri"]
+    start_job_id = f"start_{strategy_id}"
+    stop_job_id = f"stop_{strategy_id}"
+
+    try:
+        plan = session_schedule.resolve_plan(exch, user_start, user_stop, days, now=now)
+    except session_schedule.CalendarUnavailable as exc:
+        # Unknown, not "closed": remove every job and refuse to start. The
+        # per-minute enforcer retries the arm once the calendar is readable.
+        _remove_scheduler_job(start_job_id)
+        _remove_scheduler_job(stop_job_id)
+        message = f"{exch} session calendar unavailable; not started ({exc})"
+        _update_config(
+            strategy_id,
+            {
+                "paused_reason": "calendar_unavailable",
+                "paused_message": message,
+                "schedule_blocked_reason": "calendar_unavailable",
+                "next_start_iso": None,
+                "armed_start_iso": None,
+                "must_stop_iso": None,
+                "session_label": None,
+                "session_active": False,
+            },
+        )
+        logger.warning(f"Strategy {strategy_id} schedule not armed: {message}")
+        return {"blocked": True, "reason": "calendar_unavailable", "message": message}
+
+    payload = plan.to_dict()
+    reference_now = now if now is not None else datetime.now(IST)
+    if reference_now.tzinfo is None:
+        reference_now = IST.localize(reference_now)
+    else:
+        reference_now = reference_now.astimezone(IST)
+
+    if plan.blocked:
+        # Determinable but nothing qualifies (closed every selected day in
+        # the planning window, or the user window never meets a session).
+        # The start job comes off; whatever stop job was protecting a
+        # running strategy is left in place.
+        _remove_scheduler_job(start_job_id)
+        _update_config(
+            strategy_id,
+            {
+                "paused_reason": plan.reason,
+                "paused_message": plan.message,
+                "schedule_blocked_reason": plan.reason,
+                "next_start_iso": None,
+                "armed_start_iso": None,
+                "must_stop_iso": None,
+                "session_label": plan.session_label or None,
+                "session_active": False,
+            },
+        )
+        logger.warning(f"Strategy {strategy_id} ({exch}) schedule not armed: {plan.message}")
+        return payload
+
+    inside_window = bool(
+        plan.effective_start is not None
+        and plan.effective_end is not None
+        and plan.effective_start <= reference_now <= plan.effective_end
+    )
+
+    # The stop protects the session the plan was resolved against. A
+    # never-stop strategy (blank stop, crypto 24/7) gets none. The funcs are
+    # the session-releasing wrappers, not bare functions: scheduler threads
+    # have no request teardown.
+    stop_instant = plan.must_stop if has_user_stop else None
+    if SCHEDULER is not None and stop_instant is not None:
+        SCHEDULER.add_job(
+            func=functools.partial(_run_scheduled_stop, strategy_id),
+            trigger=DateTrigger(run_date=stop_instant, timezone=IST),
+            id=stop_job_id,
+            replace_existing=True,
+        )
+    else:
+        _remove_scheduler_job(stop_job_id)
+
+    if inside_window:
+        # Arming inside an open window must not fire "now" (that would
+        # surprise-start every strategy after a mid-session restart). The
+        # next session is resolved and armed explicitly.
+        next_session = None
+        try:
+            next_session = session_schedule.resolve_plan(
+                exch,
+                user_start,
+                user_stop,
+                days,
+                now=plan.effective_end + timedelta(seconds=1),
+            )
+        except session_schedule.CalendarUnavailable:
+            next_session = None
+        armed_start = next_session.next_start if (next_session and next_session.startable) else None
+        if SCHEDULER is not None and armed_start is not None:
+            SCHEDULER.add_job(
+                func=functools.partial(_run_scheduled_start, strategy_id),
+                trigger=DateTrigger(run_date=armed_start, timezone=IST),
+                id=start_job_id,
+                replace_existing=True,
+            )
+        else:
+            _remove_scheduler_job(start_job_id)
+    else:
+        armed_start = plan.next_start
+        if SCHEDULER is not None and armed_start is not None:
+            SCHEDULER.add_job(
+                func=functools.partial(_run_scheduled_start, strategy_id),
+                trigger=DateTrigger(run_date=armed_start, timezone=IST),
+                id=start_job_id,
+                replace_existing=True,
+            )
+        else:
+            _remove_scheduler_job(start_job_id)
+
+    _update_config(
+        strategy_id,
+        {
+            "next_start_iso": plan.next_start.isoformat() if plan.next_start else None,
+            "armed_start_iso": armed_start.isoformat() if armed_start else None,
+            "must_stop_iso": stop_instant.isoformat() if stop_instant else None,
+            "session_label": plan.session_label,
+            "schedule_note": plan.message,
+            "schedule_blocked_reason": None,
+            "session_active": inside_window,
+        },
+    )
+    start_text = armed_start.strftime("%Y-%m-%d %H:%M IST") if armed_start else "none"
+    stop_text = (
+        stop_instant.strftime("%Y-%m-%d %H:%M IST") if stop_instant else "never (24/7)"
+    )
+    logger.info(
+        f"Armed strategy {strategy_id} ({exch}, {plan.kind}): "
+        f"start job {start_text}, stop {stop_text}"
+    )
+    payload["must_stop"] = stop_instant.isoformat() if stop_instant else None
+    return payload
+
+
 def schedule_strategy(strategy_id, start_time, stop_time=None, days=None):
     """
-    Schedule a strategy to run at specific times (IST).
-    Allows any day of the week to support special exchange sessions (e.g., Muhurat trading).
+    Persist a strategy's schedule and arm concrete session start/stop jobs.
+
+    Times are IST HH:MM from the frontend; any weekday is allowed so special
+    sessions (e.g. Sunday Muhurat) are reachable. The actual fire times are
+    resolved per session by ``arm_strategy_session`` — holidays, early
+    closes and evening sessions clip the raw times.
     """
     if not days:
         days = ["mon", "tue", "wed", "thu", "fri"]  # Default to weekdays
@@ -2020,34 +2278,9 @@ def schedule_strategy(strategy_id, start_time, stop_time=None, days=None):
     # Normalize days to lowercase
     days = days_lower
 
-    # Create job ID
-    start_job_id = f"start_{strategy_id}"
-    stop_job_id = f"stop_{strategy_id}"
-
-    # Remove existing jobs if any
-    if SCHEDULER.get_job(start_job_id):
-        SCHEDULER.remove_job(start_job_id)
-    if SCHEDULER.get_job(stop_job_id):
-        SCHEDULER.remove_job(stop_job_id)
-
-    # Schedule start with holiday check wrapper (time is already in IST from frontend)
-    hour, minute = map(int, start_time.split(":"))
-    SCHEDULER.add_job(
-        func=functools.partial(_run_scheduled_start, strategy_id),
-        trigger=CronTrigger(hour=hour, minute=minute, day_of_week=",".join(days), timezone=IST),
-        id=start_job_id,
-        replace_existing=True,
-    )
-
-    # Schedule stop if provided (always runs for safety)
-    if stop_time:
-        hour, minute = map(int, stop_time.split(":"))
-        SCHEDULER.add_job(
-            func=functools.partial(_run_scheduled_stop, strategy_id),
-            trigger=CronTrigger(hour=hour, minute=minute, day_of_week=",".join(days), timezone=IST),
-            id=stop_job_id,
-            replace_existing=True,
-        )
+    # Drop whatever fixed jobs an older build left behind.
+    _remove_scheduler_job(f"start_{strategy_id}")
+    _remove_scheduler_job(f"stop_{strategy_id}")
 
     # Update config
     updated = _update_config(
@@ -2064,21 +2297,36 @@ def schedule_strategy(strategy_id, start_time, stop_time=None, days=None):
         raise KeyError(strategy_id)
 
     logger.debug(
-        f"Scheduled strategy {strategy_id}: {start_time} - {stop_time} IST on {days} (holiday check enforced)"
+        f"Scheduled strategy {strategy_id}: {start_time} - {stop_time} IST on {days}"
     )
+
+    # Resolve concrete times against the exchange calendar and arm. A
+    # calendar that cannot be read is a failure worth surfacing to the
+    # save, not a silent skip.
+    result = arm_strategy_session(strategy_id)
+    if result and result.get("blocked") and result.get("reason") == "calendar_unavailable":
+        raise RuntimeError(result.get("message"))
+    return result
 
 
 def unschedule_strategy(strategy_id):
     """Remove scheduling for a strategy"""
-    start_job_id = f"start_{strategy_id}"
-    stop_job_id = f"stop_{strategy_id}"
+    _remove_scheduler_job(f"start_{strategy_id}")
+    _remove_scheduler_job(f"stop_{strategy_id}")
 
-    if SCHEDULER.get_job(start_job_id):
-        SCHEDULER.remove_job(start_job_id)
-    if SCHEDULER.get_job(stop_job_id):
-        SCHEDULER.remove_job(stop_job_id)
-
-    _update_config(strategy_id, {"is_scheduled": False})
+    _update_config(
+        strategy_id,
+        {
+            "is_scheduled": False,
+            "next_start_iso": None,
+            "armed_start_iso": None,
+            "must_stop_iso": None,
+            "session_label": None,
+            "schedule_note": None,
+            "schedule_blocked_reason": None,
+            "session_active": False,
+        },
+    )
 
     logger.info(f"Unscheduled strategy {strategy_id}")
 
@@ -2349,65 +2597,73 @@ def start_strategy(strategy_id):
             f"Cleared manual stop flag for strategy {strategy_id} - scheduled auto-start resumed"
         )
 
-    # Check schedule constraints
+    # Check schedule constraints against the *effective* window: the user's
+    # HH:MM window intersected with this exchange's actual session today, so
+    # a Muhurat morning, an early close or an MCX evening session all resolve
+    # correctly instead of from weekdays and one fixed clock time.
     schedule_days = config.get("schedule_days", [])
     now = datetime.now(IST)
     day_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
     today_day = day_names[now.weekday()]
-
-    schedule_start = config.get("schedule_start")
-    schedule_stop = config.get("schedule_stop")
-
-    # Determine if we're within schedule
-    is_scheduled_day = today_day in [d.lower() for d in schedule_days] if schedule_days else True
-    is_within_hours = True
-
-    if schedule_start and schedule_stop:
-        try:
-            start_hour, start_min = map(int, schedule_start.split(":"))
-            stop_hour, stop_min = map(int, schedule_stop.split(":"))
-            start_time = now.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
-            stop_time = now.replace(hour=stop_hour, minute=stop_min, second=0, microsecond=0)
-            is_within_hours = start_time <= now <= stop_time
-        except (ValueError, AttributeError) as e:
-            logger.warning(f"Could not parse schedule times for {strategy_id}: {e}")
-
-    # Exchange-aware holiday check: an MCX strategy isn't blocked by NSE
-    # being closed; an NSE strategy isn't blocked from a Muhurat Sunday.
     exch = normalize_exchange(config.get("exchange"))
-    is_holiday = not is_trading_day(exchange=exch)
+    schedule_days_lower = [d.lower() for d in schedule_days]
+    day_ok = not schedule_days_lower or today_day in schedule_days_lower
+    in_effective_window = bool(day_ok) and is_within_schedule_time(strategy_id)
 
-    # If outside schedule (wrong day, wrong time, or holiday), just arm it for scheduled start
-    if not is_scheduled_day or not is_within_hours or is_holiday:
-        # Determine the reason and next start time
-        if is_holiday:
-            reason = "Market holiday"
-            next_start = f"next trading day at {schedule_start} IST"
-        elif not is_scheduled_day:
-            reason = f"Today ({today_day.capitalize()}) is not in schedule"
-            # Find next scheduled day
-            next_days = list(schedule_days)
-            next_start = f"next scheduled day ({', '.join(next_days)}) at {schedule_start} IST"
+    # Outside the effective window (wrong day, before/after the session,
+    # closed day, or a calendar that cannot be read): re-arm concrete times
+    # and report them; never start a process.
+    if not in_effective_window:
+        plan_payload = None
+        try:
+            plan_payload = arm_strategy_session(strategy_id)
+        except Exception:
+            logger.exception(f"Could not re-arm strategy {strategy_id} from the Start route")
+
+        if not day_ok:
+            reason = f"Today ({today_day.capitalize()}) is not in the schedule"
+        elif plan_payload and plan_payload.get("blocked"):
+            reason = plan_payload.get("message") or "No startable trading session"
         else:
-            reason = f"Outside schedule hours ({schedule_start} - {schedule_stop} IST)"
-            if now < start_time:
-                next_start = f"today at {schedule_start} IST"
-            else:
-                next_start = f"next scheduled day at {schedule_start} IST"
+            reason = "Outside the exchange session right now"
+
+        next_text = None
+        stop_text = None
+        if plan_payload:
+            next_text = _format_schedule_instant(plan_payload.get("next_start"))
+            stop_text = _format_schedule_instant(plan_payload.get("must_stop"))
+
+        if next_text:
+            details = f"Will start {next_text} IST"
+            if stop_text:
+                details += f"; must stop {stop_text} IST"
+            label = plan_payload.get("session_label") if plan_payload else None
+            if label:
+                details += f". {label}"
+        else:
+            schedule_start = config.get("schedule_start")
+            details = f"Will start on the next scheduled day at {schedule_start} IST"
 
         logger.info(
-            f"Strategy {strategy_id} armed for scheduled start. Reason: {reason}. Next start: {next_start}"
+            f"Strategy {strategy_id} armed for scheduled start. Reason: {reason}. {details}"
         )
 
         return jsonify(
             {
                 "status": "success",
-                "message": f"Strategy scheduled to start. {reason}. Will start {next_start}.",
-                "data": {"armed": True, "reason": reason, "next_start": next_start},
+                "message": f"Strategy scheduled to start. {reason}. {details}.",
+                "data": {
+                    "armed": True,
+                    "blocked": bool(plan_payload and plan_payload.get("blocked")),
+                    "reason": reason,
+                    "next_start": next_text,
+                    "must_stop": stop_text,
+                    "plan": plan_payload,
+                },
             }
         )
 
-    # Within schedule - start immediately
+    # Within the effective session - start immediately
     initialize_with_app_context()
     success, message = start_strategy_process(strategy_id)
     return jsonify({"status": "success" if success else "error", "message": message})
@@ -2528,7 +2784,7 @@ def schedule_strategy_route(strategy_id):
             strategy_id, {"exchange": normalize_exchange(exchange_in)}, save=False
         ):
             raise KeyError(strategy_id)
-        schedule_strategy(strategy_id, start_time, stop_time, days)
+        plan = schedule_strategy(strategy_id, start_time, stop_time, days)
         save_configs()
         exch = (get_strategy_config(strategy_id) or {}).get("exchange", DEFAULT_STRATEGY_EXCHANGE)
         schedule_info = f"[{exch}] Scheduled at {start_time} IST"
@@ -2536,9 +2792,50 @@ def schedule_strategy_route(strategy_id):
             schedule_info += f" - {stop_time} IST"
         elif exch in CRYPTO_EXCHANGES:
             schedule_info += ", runs 24/7"
-        return jsonify({"status": "success", "message": schedule_info})
+        if plan and plan.get("blocked"):
+            # Determinable but no qualifying session: saved (so the daily
+            # re-arm picks it up) but reported plainly rather than armed.
+            schedule_info += f". Not armed: {plan.get('message')}"
+        return jsonify({"status": "success", "message": schedule_info, "plan": plan})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@python_strategy_bp.route("/api/schedule-preview")
+@check_session_validity
+def api_schedule_preview():
+    """Preview the concrete next start / mandatory stop for schedule inputs.
+
+    Used by the existing Edit Schedule page so the resolved times and the
+    adopted session are visible before saving. A calendar that cannot be
+    read answers 503 with the fail-closed reason.
+    """
+    from services import session_schedule
+
+    exch = normalize_exchange(request.args.get("exchange"))
+    start = request.args.get("start") or None
+    stop = request.args.get("stop") or None
+    days_raw = request.args.get("days") or ""
+    days = [d.strip() for d in days_raw.split(",") if d.strip()] or None
+
+    try:
+        plan = session_schedule.resolve_plan(exch, start, stop, days)
+    except session_schedule.CalendarUnavailable as exc:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "blocked": True,
+                    "reason": "calendar_unavailable",
+                    "message": str(exc),
+                }
+            ),
+            503,
+        )
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+    return jsonify({"status": "success", "plan": plan.to_dict()})
 
 
 @python_strategy_bp.route("/unschedule/<strategy_id>", methods=["POST"])
@@ -2871,6 +3168,19 @@ def check_contracts():
 # =============================================================================
 
 
+def _format_schedule_instant(iso_value) -> str | None:
+    """An ISO instant as 'Mon 02 Nov 09:15 IST'; None if unparseable."""
+    if not iso_value:
+        return None
+    try:
+        instant = datetime.fromisoformat(str(iso_value))
+        if instant.tzinfo is None:
+            instant = IST.localize(instant)
+        return instant.astimezone(IST).strftime("%a %d %b %H:%M IST")
+    except (ValueError, TypeError):
+        return None
+
+
 def get_schedule_status(config):
     """
     Determine detailed schedule status for a strategy.
@@ -2878,8 +3188,13 @@ def get_schedule_status(config):
 
     Status meanings:
     - manually_stopped: User clicked stop, won't auto-start until manual start
-    - scheduled: Strategy is armed and will auto-start at scheduled time
-    - paused: Market holiday, strategy won't run today
+    - scheduled: Strategy is armed and will auto-start at the resolved instant
+    - paused: Holiday/closed day, or the calendar could not be resolved
+
+    The concrete arming times written by ``arm_strategy_session`` are the
+    preferred source: they reflect the actual adopted session (regular,
+    special or evening). Fixed HH:MM text remains only as a fallback for
+    rows that have never been re-armed.
     """
     now = datetime.now(IST)
     day_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -2895,10 +3210,29 @@ def get_schedule_status(config):
     if config.get("manually_stopped"):
         return "manually_stopped", "Manually stopped - click Start to resume"
 
-    # Exchange-aware pause: any non-trading day for the strategy's exchange
+    # Fail-closed arm: nothing may start while the calendar is unreadable.
+    if config.get("schedule_blocked_reason") == "calendar_unavailable":
+        return "paused", config.get("paused_message", "Trading calendar unavailable - not started")
+
+    # Exchange-aware pause: any non-trading day for the strategy's exchange,
+    # or a plan blocked for a determinable reason.
     paused_reason = config.get("paused_reason")
-    if paused_reason in ("holiday", "weekend"):
+    if paused_reason in ("holiday", "weekend") + tuple(
+        r for r in SCHEDULE_BLOCKED_REASONS if r != "calendar_unavailable"
+    ):
         return "paused", config.get("paused_message", "Exchange closed today")
+
+    # Concrete session-resolved times (preferred; written on every arm).
+    armed_text = _format_schedule_instant(config.get("armed_start_iso"))
+    stop_text = _format_schedule_instant(config.get("must_stop_iso"))
+    session_label = config.get("session_label")
+    if armed_text:
+        suffix = f" · Must stop {stop_text}" if stop_text else ""
+        if session_label:
+            suffix += f" · {session_label}"
+        if config.get("session_active"):
+            return "scheduled", f"Session open now; next auto-start {armed_text}{suffix}"
+        return "scheduled", f"Next: {armed_text}{suffix}"
 
     # Strategy is armed (not manually stopped) - show "Scheduled" with context
     # Check if today is in schedule days
@@ -3058,6 +3392,13 @@ def api_get_strategies():
                 "schedule_start_time": config.get("schedule_start"),
                 "schedule_stop_time": config.get("schedule_stop"),
                 "schedule_days": config.get("schedule_days", []),
+                # Concrete session-resolved instants written by the arm pass.
+                "next_start": config.get("next_start_iso"),
+                "armed_start": config.get("armed_start_iso"),
+                "must_stop": config.get("must_stop_iso"),
+                "session_label": config.get("session_label"),
+                "session_active": config.get("session_active", False),
+                "schedule_blocked_reason": config.get("schedule_blocked_reason"),
                 "last_started": config.get("last_started"),
                 "last_stopped": config.get("last_stopped"),
                 "error_message": config.get("error_message"),
@@ -3200,6 +3541,13 @@ def api_get_strategy(strategy_id):
                 "schedule_start_time": config.get("schedule_start"),
                 "schedule_stop_time": config.get("schedule_stop"),
                 "schedule_days": config.get("schedule_days", []),
+                # Concrete session-resolved instants written by the arm pass.
+                "next_start": config.get("next_start_iso"),
+                "armed_start": config.get("armed_start_iso"),
+                "must_stop": config.get("must_stop_iso"),
+                "session_label": config.get("session_label"),
+                "session_active": config.get("session_active", False),
+                "schedule_blocked_reason": config.get("schedule_blocked_reason"),
                 "last_started": config.get("last_started"),
                 "last_stopped": config.get("last_stopped"),
                 "error_message": config.get("error_message"),

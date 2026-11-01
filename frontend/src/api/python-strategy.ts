@@ -1,3 +1,4 @@
+import type { SessionPlan } from '@/lib/sessionSchedule'
 import type {
   EnvironmentVariables,
   LogContent,
@@ -6,6 +7,7 @@ import type {
   PythonStrategy,
   PythonStrategyContent,
   ScheduleConfig,
+  ScheduleSaveResponse,
   StrategyExchangeList,
 } from '@/types/python-strategy'
 import type { ApiResponse } from '@/types/trading'
@@ -146,17 +148,38 @@ export const pythonStrategyApi = {
   },
 
   /**
-   * Schedule a strategy
+   * Schedule a strategy. The response carries the concrete session plan
+   * (next start / mandatory stop / adopted session) the backend armed.
    */
   scheduleStrategy: async (
     strategyId: string,
     config: ScheduleConfig
-  ): Promise<ApiResponse<void>> => {
-    const response = await webClient.post<ApiResponse<void>>(
+  ): Promise<ScheduleSaveResponse> => {
+    const response = await webClient.post<ScheduleSaveResponse>(
       `/python/schedule/${strategyId}`,
       config
     )
     return response.data
+  },
+
+  /**
+   * Preview the concrete next start / mandatory stop for schedule inputs,
+   * without saving. 503 means the calendar could not be read (fail closed).
+   */
+  schedulePreview: async (config: {
+    exchange: string
+    start: string | null
+    stop: string | null
+    days: string[] | null
+  }): Promise<SessionPlan> => {
+    const params = new URLSearchParams({ exchange: config.exchange })
+    if (config.start) params.set('start', config.start)
+    if (config.stop) params.set('stop', config.stop)
+    if (config.days?.length) params.set('days', config.days.join(','))
+    const response = await webClient.get<{ plan: SessionPlan }>(
+      `/python/api/schedule-preview?${params.toString()}`
+    )
+    return response.data.plan
   },
 
   /**

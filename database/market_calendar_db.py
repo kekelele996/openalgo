@@ -877,15 +877,25 @@ def get_holiday_exchange_window(
         return None
 
 
-def get_effective_session_window(
-    query_date: date, exchange: str
-) -> Optional[Dict[str, Any]]:
+def resolve_session_window(query_date: date, exchange: str) -> Optional[Dict[str, Any]]:
     """
-    Single source of truth for "what is the trading window for <exchange> on
-    <date>?".
+    Strict single source of truth for "what is the trading window for
+    <exchange> on <date>?".
 
-    Returns a dict with epoch-ms `start_ms` / `end_ms` (in IST midnight terms)
-    plus an `is_special` flag, or None if the exchange is closed that day.
+    Returns a dict with epoch-ms ``start_ms`` / ``end_ms``, an ``is_special``
+    flag, a ``kind`` label and (when the date is a holiday row) the holiday
+    ``description``; returns None when the exchange is genuinely shut that
+    day. Unlike :func:`get_effective_session_window`, infrastructure failures
+    (missing tables, database errors) propagate: a scheduler that must not
+    start into a session it could not verify needs "closed" and "could not be
+    determined" to be different answers.
+
+    ``kind`` is one of:
+      - ``crypto``  — round-the-clock segment
+      - ``special`` — SPECIAL_SESSION row (e.g. Sunday Diwali Muhurat)
+      - ``evening`` — explicit window on a TRADING_HOLIDAY for an exchange the
+                      holiday leaves open (e.g. MCX 17:00-23:55 on an NSE holiday)
+      - ``regular`` — ordinary weekday session from the configured timings
 
     Resolution order:
       1. CRYPTO -> always 00:00-23:59:59 (24/7)
@@ -914,55 +924,99 @@ def get_effective_session_window(
             "start_ms": midnight_ms + timings["start_offset"],
             "end_ms": midnight_ms + timings["end_offset"],
             "is_special": False,
+            "kind": "crypto",
+            "description": None,
         }
 
-    try:
-        # 2. Special session
-        special = get_special_session(query_date, exch)
-        if special:
+    # 2. Special session
+    special_holiday = (
+        Holiday.query.filter(Holiday.holiday_date == query_date)
+        .filter(Holiday.holiday_type == "SPECIAL_SESSION")
+        .first()
+    )
+    if special_holiday is not None:
+        ex_row = HolidayExchange.query.filter(
+            HolidayExchange.holiday_id == special_holiday.id,
+            HolidayExchange.exchange_code == exch,
+            HolidayExchange.is_open == True,  # noqa: E712
+        ).first()
+        if ex_row is not None and ex_row.start_time is not None and ex_row.end_time is not None:
             return {
-                "start_ms": special["start_ms"],
-                "end_ms": special["end_ms"],
+                "start_ms": int(ex_row.start_time),
+                "end_ms": int(ex_row.end_time),
                 "is_special": True,
+                "kind": "special",
+                "description": special_holiday.description,
             }
 
-        # 3 & 4. Trading holiday with explicit open window or closed
-        holiday = (
-            Holiday.query.filter(Holiday.holiday_date == query_date)
-            .filter(Holiday.holiday_type == "TRADING_HOLIDAY")
-            .first()
-        )
-        if holiday:
-            ex_row = HolidayExchange.query.filter(
-                HolidayExchange.holiday_id == holiday.id,
-                HolidayExchange.exchange_code == exch,
-            ).first()
-            if ex_row:
-                if not ex_row.is_open:
-                    return None
-                if ex_row.start_time is not None and ex_row.end_time is not None:
-                    return {
-                        "start_ms": int(ex_row.start_time),
-                        "end_ms": int(ex_row.end_time),
-                        "is_special": True,
-                    }
-            # Exchange not listed on this holiday row -> treat as open with default timings
+    # 3 & 4. Trading holiday with explicit open window or closed
+    holiday = (
+        Holiday.query.filter(Holiday.holiday_date == query_date)
+        .filter(Holiday.holiday_type == "TRADING_HOLIDAY")
+        .first()
+    )
+    if holiday:
+        ex_row = HolidayExchange.query.filter(
+            HolidayExchange.holiday_id == holiday.id,
+            HolidayExchange.exchange_code == exch,
+        ).first()
+        if ex_row:
+            if not ex_row.is_open:
+                return None
+            if ex_row.start_time is not None and ex_row.end_time is not None:
+                return {
+                    "start_ms": int(ex_row.start_time),
+                    "end_ms": int(ex_row.end_time),
+                    "is_special": True,
+                    "kind": "evening",
+                    "description": holiday.description,
+                }
+        # Exchange not listed on this holiday row -> treat as open with default timings
 
-        # 5. Weekend with no special session
-        if query_date.weekday() >= 5:
-            return None
+    # 5. Weekend with no special session
+    if query_date.weekday() >= 5:
+        return None
 
-        # 6. Default timings
-        timings = _get_timing_offsets().get(exch, DEFAULT_MARKET_TIMINGS.get(exch, {}))
-        if not timings:
-            return None
-        return {
-            "start_ms": midnight_ms + timings["start_offset"],
-            "end_ms": midnight_ms + timings["end_offset"],
-            "is_special": False,
-        }
+    # 6. Default timings
+    timings = _get_timing_offsets().get(exch, DEFAULT_MARKET_TIMINGS.get(exch, {}))
+    if not timings:
+        return None
+    return {
+        "start_ms": midnight_ms + timings["start_offset"],
+        "end_ms": midnight_ms + timings["end_offset"],
+        "is_special": False,
+        "kind": "regular",
+        "description": None,
+    }
+
+
+def describe_session_window(query_date: date, exchange: str) -> Optional[Dict[str, Any]]:
+    """Strict, labelled session window for a date.
+
+    Same answer as :func:`resolve_session_window` — kept under its own name
+    for callers that display which session a schedule was resolved against
+    (regular / special / evening) and why the hours differ. Propagates
+    calendar failures instead of masking them as a closure.
+    """
+    return resolve_session_window(query_date, exchange)
+
+
+def get_effective_session_window(
+    query_date: date, exchange: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Lenient wrapper around :func:`resolve_session_window`.
+
+    Returns the session window (with epoch-ms `start_ms` / `end_ms` and an
+    `is_special` flag), or None both when the exchange is shut that day *and*
+    when the calendar cannot be read. Callers that must distinguish "closed"
+    from "unknown" — schedulers arming a plan — use the strict resolver and
+    fail closed themselves.
+    """
+    try:
+        return resolve_session_window(query_date, exchange)
     except Exception as e:
-        logger.debug(f"get_effective_session_window failed for {query_date} {exch}: {e}")
+        logger.debug(f"get_effective_session_window failed for {query_date} {exchange}: {e}")
         return None
 
 
